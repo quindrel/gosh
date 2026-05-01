@@ -29,10 +29,11 @@ type (
 	}
 
 	// GetZoneResponse represents a request to get a DNSZone (domain).
+	// search_domains returns matching DNSZone summaries; only Name,
+	// ClientID, and TemplateID are populated (Pending is returned by
+	// list_domains but not by search_domains).
 	GetZoneResponse struct {
-		Return []struct {
-			Name string `json:"name"`
-		} `json:"return"`
+		Return []models.DNSZone `json:"return"`
 		models.APIResponse
 	}
 )

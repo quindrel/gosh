@@ -27,7 +27,8 @@ export SH_CLOUD_SERVER=<your-cloud-container-name>     # a cloud container you c
 export SH_TEST_SERVER=<a-test-server-name>             # a low-stakes server you control
 
 # Run them
-go run ./examples/server-reads      # safest — read-only, no env beyond key+id
+go run ./examples/full-overview     # safest — read-only counts across every namespace
+go run ./examples/server-reads      # read-only server diagnostics
 go run ./examples/dns               # creates+deletes a DNS zone
 go run ./examples/mail              # full mail lifecycle
 go run ./examples/cloud-volume      # creates+deletes a volume
@@ -46,6 +47,29 @@ env skips that example with a clear note).
 This table shows **which endpoint each example exercises and
 what passing the example proves about the SDK**. If you can run
 all examples to green, you've validated everything in the table.
+
+### `examples/full-overview/` — every-namespace read-only smoke test
+
+| Endpoint                              | Proves                                                          |
+|---------------------------------------|------------------------------------------------------------------|
+| `server.List`                         | API auth + pagination wrapper                                    |
+| `dns.ListZones`, `dns.ListIPs`        | Top-level DNS reads                                             |
+| `mail.ListDomains` (gated)            | Mail-server identifier round-trips (when SH_MAIL_SERVER set)    |
+| `srs.ListDomains`, `srs.ListContacts` | SRS pagination + contact-summary parsing                        |
+| `ssl.ListCertificates`                | SSL summary list                                                |
+| `cloud.stack.List`                    | Cross-server stack inventory (no filter = all)                  |
+| `cloud.volume.List`                   | Volume inventory                                                |
+| `cloud.image.List`                    | Image catalogue                                                 |
+| `cloud.db.List`                       | Database inventory                                              |
+| `cloud.server.List`                   | Cloud-server inventory                                          |
+| `ssh.key.List`                        | SSH key inventory                                               |
+| `bandwidth.ListResources`             | Per-client quota groups                                         |
+| `snapshot.List` (first server)        | Per-server snapshot inventory                                   |
+
+One line of output per call, counts only. Useful as a 30-second
+"is gosh talking to this account?" check before running a heavier
+example. Skips mail and snapshot gracefully when their preconditions
+aren't satisfied.
 
 ### `examples/server-reads/` — read-only smoke test
 
@@ -128,6 +152,7 @@ are placeholders only.
 
 | Example              | Env vars beyond `SH_API_KEY` + `SH_CLIENT_ID`                   |
 |---------------------|------------------------------------------------------------------|
+| `full-overview`     | `SH_CLIENT_ID` is **optional** here — if unset, the program calls `info.NewClientWithDiscovery` to resolve it from `api/get_info.json`. Optional `SH_MAIL_SERVER` to include the mail-domains read. |
 | `server-reads`      | (none — picks the first server returned by `server.List`)       |
 | `dns`               | (none — generates a unique zone name; whois-checked first)      |
 | `mail`              | `SH_MAIL_SERVER` — mail service identifier (e.g. `sth-mail-air` for SiteHost's shared mail) |

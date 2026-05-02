@@ -48,6 +48,7 @@ run() {
     fi
 }
 
+run full-overview
 run server-reads
 run dns
 run mail            SH_MAIL_SERVER

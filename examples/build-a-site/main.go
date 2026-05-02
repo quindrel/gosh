@@ -76,6 +76,7 @@ import (
 	cloudServer "github.com/sitehostnz/gosh/pkg/api/cloud/server"
 	cloudSSHUser "github.com/sitehostnz/gosh/pkg/api/cloud/ssh/user"
 	cloudStack "github.com/sitehostnz/gosh/pkg/api/cloud/stack"
+	"github.com/sitehostnz/gosh/pkg/api/dns"
 	"github.com/sitehostnz/gosh/pkg/api/info"
 	"github.com/sitehostnz/gosh/pkg/api/job"
 	sshKey "github.com/sitehostnz/gosh/pkg/api/ssh/key"
@@ -100,7 +101,7 @@ const markerLen = 16
 // state holds everything the program creates so cleanup + audit can reach it.
 type state struct {
 	ccs        models.CloudServer
-	hostname   string // FQDN — also used as cloud.stack label
+	hostname   string // sth.nz hostname for Phase A (always set)
 	stackName  string // cc<hex> — also the container_name
 	keyID      string // ssh.key id
 	dbName     string // app DB name
@@ -109,6 +110,11 @@ type state struct {
 	sshUser    string // SSH user for code deploy
 	sshPriv    ed25519.PrivateKey
 	marker     string // unique string we expect to see served
+
+	// Phase B fields (zero-valued when Phase B doesn't run)
+	domain         string   // BYO test domain or auto-generated gosh-test-<hex>.co.nz
+	dnsRecordIDs   []string // every DNS record we created, for cleanup
+	zoneCreated    bool     // whether we created the DNS zone
 }
 
 func main() {
@@ -147,9 +153,27 @@ func run() int {
 		st.audit(ctx, c)
 	}()
 
+	// Phase B opts in via JOURNEY_DOMAIN. Auto-generates a unique
+	// `gosh-test-<8hex>.co.nz` if the env var is unset but the
+	// JOURNEY_PHASE_B=1 flag is set explicitly. Without either, only
+	// Phase A runs.
+	if domain := os.Getenv("JOURNEY_DOMAIN"); domain != "" {
+		st.domain = domain
+	} else if os.Getenv("JOURNEY_PHASE_B") == "1" {
+		st.domain = "gosh-test-" + randHex(8) + ".co.nz"
+	}
+
 	if err := runPhaseA(ctx, c, st); err != nil {
 		log.Printf("Fatal: %v", err)
 		rc = 1
+		return rc
+	}
+
+	if st.domain != "" {
+		if err := runPhaseB(ctx, c, st); err != nil {
+			log.Printf("Fatal: %v", err)
+			rc = 1
+		}
 	}
 	return rc
 }
@@ -212,7 +236,15 @@ func runPhaseA(ctx context.Context, c *api.Client, st *state) error {
 	}
 	st.stackName = gen.Return.Name
 	st.hostname = fmt.Sprintf("gosh.%s.sth.nz", st.ccs.PrimaryIP)
-	compose := buildWWWCompose(st.stackName, st.hostname)
+	// Phase A always uses the sth.nz hostname. Phase B's test domain
+	// is folded into the VIRTUAL_HOST list at stack-creation time
+	// so a single stack serves both — avoids needing cloud.stack.Update
+	// later. When Phase B isn't running, st.domain is empty.
+	hostnames := []string{st.hostname}
+	if st.domain != "" {
+		hostnames = append(hostnames, st.domain)
+	}
+	compose := buildWWWCompose(st.stackName, hostnames)
 
 	addStack, err := cloudStack.New(c).Add(ctx, cloudStack.AddRequest{
 		ServerName:    st.ccs.Name,
@@ -347,9 +379,139 @@ func runPhaseA(ctx context.Context, c *api.Client, st *state) error {
 	return nil
 }
 
+// runPhaseB runs against a Phase B test domain (st.domain), already
+// folded into Phase A's stack VIRTUAL_HOST. v1: DNS hosting + records
+// only. Mail provisioning, SMTP/IMAP loopback, and Let's Encrypt are
+// follow-up commits.
+func runPhaseB(ctx context.Context, c *api.Client, st *state) error {
+	log.Printf("─── Phase B (domain=%s) ───", st.domain)
+
+	dnsClient := dns.New(c)
+
+	// ── B.1 — host DNS for the test domain ─────────────────────────────
+	//
+	// dns.CreateZone accepts unregistered synthetic domain names. The
+	// zone exists in SiteHost's nameservers and is queryable via
+	// `dig @<sitehost-ns>`, but won't resolve via public recursive
+	// resolvers unless the domain is registered with NS records
+	// pointing at SiteHost. For Phase B v1 verification we bypass
+	// public DNS by hitting the container IP with a custom Host
+	// header — that proves nginx-proxy routes for our hostname
+	// regardless of public DNS state.
+	if _, err := dnsClient.CreateZone(ctx, dns.CreateZoneRequest{DomainName: st.domain}); err != nil {
+		return fmt.Errorf("dns.CreateZone: %w", err)
+	}
+	st.zoneCreated = true
+	step("B.1", "dns zone created: %s", st.domain)
+
+	// ── B.2 — add A and CNAME records pointing at the container ────────
+	a, err := dnsClient.AddRecord(ctx, dns.AddRecordRequest{
+		Domain:  st.domain,
+		Type:    "A",
+		Name:    st.domain, // apex (@)
+		Content: st.ccs.PrimaryIP,
+	})
+	if err != nil {
+		return fmt.Errorf("dns.AddRecord A: %w", err)
+	}
+	st.dnsRecordIDs = append(st.dnsRecordIDs, a.Return.ID)
+
+	cname, err := dnsClient.AddRecord(ctx, dns.AddRecordRequest{
+		Domain:  st.domain,
+		Type:    "CNAME",
+		Name:    "www." + st.domain,
+		Content: st.domain,
+	})
+	if err != nil {
+		return fmt.Errorf("dns.AddRecord CNAME: %w", err)
+	}
+	st.dnsRecordIDs = append(st.dnsRecordIDs, cname.Return.ID)
+	step("B.2", "dns records added: A %s -> %s, CNAME www -> @",
+		st.domain, st.ccs.PrimaryIP)
+
+	// ── B.3 — verify the zone via list_records ─────────────────────────
+	listResp, err := dnsClient.ListRecords(ctx, dns.ListRecordsRequest{Domain: st.domain})
+	if err != nil {
+		return fmt.Errorf("dns.ListRecords: %w", err)
+	}
+	step("B.3", "dns.ListRecords: %d records (NS + SOA + our two)", len(listResp.Return))
+
+	// ── B.4 — verify HTTP serves through the test domain ───────────────
+	//
+	// We hit the container IP directly with Host: <test-domain> in
+	// the request headers. nginx-proxy sees the Host header and
+	// routes to our container's vhost. This bypasses public DNS,
+	// which won't resolve for an unregistered synthetic domain.
+	body, err := getWithHost(ctx, "http://"+st.ccs.PrimaryIP+"/", st.domain, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("phase B http verify: %w", err)
+	}
+	if !strings.Contains(body, st.marker) {
+		return fmt.Errorf("phase B response missing marker %q", st.marker)
+	}
+	step("B.4", "served HTTP 200 with marker %s via Host: %s", st.marker, st.domain)
+
+	fmt.Println()
+	fmt.Printf("  → externally verifiable while it's still up (bypasses public DNS):\n")
+	fmt.Printf("      curl -i http://%s/ --resolve %s:80:%s\n", st.domain, st.domain, st.ccs.PrimaryIP)
+	fmt.Println()
+	return nil
+}
+
+// getWithHost issues a GET to url with the Host header overridden.
+// Used to hit a container by IP while presenting a hostname for
+// nginx-proxy's vhost routing.
+func getWithHost(ctx context.Context, url, host string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 10 * time.Second}
+	var lastErr error
+	var sleep time.Duration
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+		req.Host = host
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return string(body), nil
+			}
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+		}
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("timed out")
+	}
+	return "", lastErr
+}
+
 // cleanup tears down everything in reverse order. Each step is best-effort.
 func (st *state) cleanup(ctx context.Context, c *api.Client) {
 	log.Printf("─── Cleanup ───")
+
+	// Phase B teardown — DNS records, then zone. Reverse-add order.
+	dnsClient := dns.New(c)
+	for i := len(st.dnsRecordIDs) - 1; i >= 0; i-- {
+		id := st.dnsRecordIDs[i]
+		if _, err := dnsClient.DeleteRecord(ctx, dns.DeleteRecordRequest{
+			Domain: st.domain, RecordID: id,
+		}); err != nil {
+			log.Printf("⚠ dns.DeleteRecord %s: %v", id, err)
+		} else {
+			step("CB.1", "dns record deleted: id=%s", id)
+		}
+	}
+	if st.zoneCreated {
+		if _, err := dnsClient.DeleteZone(ctx, dns.DeleteZoneRequest{DomainName: st.domain}); err != nil {
+			log.Printf("⚠ dns.DeleteZone %s: %v", st.domain, err)
+		} else {
+			step("CB.2", "dns zone deleted: %s", st.domain)
+		}
+	}
 
 	if st.sshUser != "" && st.ccs.Name != "" {
 		// cloud.ssh.user.Delete appears to be two-phase server-side:
@@ -445,6 +607,20 @@ func (st *state) cleanup(ctx context.Context, c *api.Client) {
 func (st *state) audit(ctx context.Context, c *api.Client) {
 	log.Printf("─── Audit ───")
 
+	// Phase B audit: zone should be gone from list_domains.
+	if st.zoneCreated {
+		zones, err := dns.New(c).ListZones(ctx, nil)
+		if err == nil {
+			if anyMatch(zones.Return.Data, func(z models.DNSZone) bool { return z.Name == st.domain }) {
+				log.Printf("⚠ dns zone %s still present after cleanup", st.domain)
+			} else {
+				step("DB.1", "dns.ListZones: our zone absent ✓")
+			}
+		} else {
+			log.Printf("⚠ dns.ListZones for audit: %v", err)
+		}
+	}
+
 	if stacks, err := cloudStack.New(c).List(ctx, cloudStack.ListRequest{ServerName: st.ccs.Name}); err == nil {
 		if anyMatch(stacks.Return.Stacks, func(s models.Stack) bool { return s.Name == st.stackName }) {
 			log.Printf("⚠ stack %s still present after cleanup", st.stackName)
@@ -517,13 +693,26 @@ func buildClient(ctx context.Context, apiKey, clientID string) (*api.Client, err
 	return info.NewClientWithDiscovery(ctx, apiKey)
 }
 
-func buildWWWCompose(name, hostname string) string {
+// buildWWWCompose generates the docker_compose body for a www-type
+// stack. hostnames is the list of FQDNs the container should respond
+// to via nginx-proxy — typically the sth.nz wildcard hostname for
+// Phase A, optionally augmented with a Phase B test domain. The
+// first entry becomes CERT_NAME (LE primary subject); all entries
+// (and their www. variants) are joined into VIRTUAL_HOST and
+// website.vhosts.
+func buildWWWCompose(name string, hostnames []string) string {
+	primary := hostnames[0]
+	var parts []string
+	for _, h := range hostnames {
+		parts = append(parts, h, "www."+h)
+	}
+	vhosts := strings.Join(parts, ",")
 	return fmt.Sprintf(`version: '2.1'
 services:
     %s:
         container_name: %s
         environment:
-            - 'VIRTUAL_HOST=%s,www.%s'
+            - 'VIRTUAL_HOST=%s'
             - CERT_NAME=%s
         expose:
             - 80/tcp
@@ -532,7 +721,7 @@ services:
             - nz.sitehost.container.label=%s
             - nz.sitehost.container.type=www
             - nz.sitehost.container.monitored=True
-            - 'nz.sitehost.container.website.vhosts=%s,www.%s'
+            - 'nz.sitehost.container.website.vhosts=%s'
             - nz.sitehost.container.image_update=True
             - nz.sitehost.container.production_mode=False
             - nz.sitehost.container.backup_disable=False
@@ -549,11 +738,11 @@ networks:
             name: infra_default
 `,
 		name, name,
-		hostname, hostname,
-		hostname,
+		vhosts,
+		primary,
 		wwwImage,
-		hostname,
-		hostname, hostname,
+		primary,
+		vhosts,
 		name, name, name, name, name,
 	)
 }

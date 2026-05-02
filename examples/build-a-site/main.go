@@ -553,6 +553,17 @@ func runPhaseBRegister(ctx context.Context, c *api.Client, st *state) error {
 	// accepts identical IDs for registrant/admin/technical/billing.
 	// Term is in MONTHS. .nz registry minimum is 12 months — sending
 	// Term=1 fails with "must be registered for a minimum of 12 months".
+	//
+	// SAFETY: print the domain name prominently BEFORE CreateDomain
+	// goes out so the operator can manually cancel from the dashboard
+	// if the program crashes between submission and cleanup.
+	fmt.Println()
+	fmt.Println("  ╔═══════════════════════════════════════════════════════════╗")
+	fmt.Printf("  ║  ABOUT TO REGISTER:  %-37s║\n", st.domain)
+	fmt.Println("  ║  If this program crashes, cancel manually via dashboard   ║")
+	fmt.Println("  ║  within the .nz 5-day grace window.                       ║")
+	fmt.Println("  ╚═══════════════════════════════════════════════════════════╝")
+	fmt.Println()
 	regResp, err := srsClient.CreateDomain(ctx, srs.CreateDomainOptions{
 		Domain:            st.domain,
 		Term:              12,
@@ -564,10 +575,18 @@ func runPhaseBRegister(ctx context.Context, c *api.Client, st *state) error {
 	if err != nil {
 		return fmt.Errorf("srs.CreateDomain: %w", err)
 	}
-	if err := waitForJobOf(ctx, c, regResp.Return.ID, regResp.Return.Type, 10*time.Minute); err != nil {
-		return fmt.Errorf("srs.CreateDomain job: %w", err)
-	}
+	// SAFETY: set domainRegistered=true IMMEDIATELY after the API
+	// accepts the request, BEFORE waitForJob. If waitForJob times out
+	// (e.g. fraud-block holds the job in Pending past our deadline),
+	// the registration may still complete eventually — and cleanup
+	// must call CancelDomain regardless of wait-state. Setting the
+	// flag reflects "the API accepted the request" rather than "we
+	// observed the job complete."
 	st.domainRegistered = true
+
+	if err := waitForJobOf(ctx, c, regResp.Return.ID, regResp.Return.Type, 10*time.Minute); err != nil {
+		return fmt.Errorf("srs.CreateDomain job: %w (cleanup will still attempt cancel)", err)
+	}
 	step("B.0d", "srs.CreateDomain: %s registered ✓ (cancel within 5 days for refund)", st.domain)
 
 	// ── B.0e — confirm Active ──────────────────────────────────────────

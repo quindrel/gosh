@@ -3,6 +3,7 @@ module github.com/sitehostnz/gosh
 go 1.24.4
 
 require (
+	github.com/emersion/go-imap v1.2.1
 	github.com/golangci/golangci-lint/v2 v2.1.6
 	github.com/google/go-querystring v1.1.0
 	github.com/ory/go-acc v0.2.8
@@ -59,6 +60,7 @@ require (
 	github.com/denis-tingaikin/go-header v0.5.0 // indirect
 	github.com/dgraph-io/ristretto v0.0.2 // indirect
 	github.com/dlclark/regexp2 v1.11.5 // indirect
+	github.com/emersion/go-sasl v0.0.0-20200509203442-7bfe0ed36a21 // indirect
 	github.com/ettle/strcase v0.2.0 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/fatih/structtag v1.2.0 // indirect

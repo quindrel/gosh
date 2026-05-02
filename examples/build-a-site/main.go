@@ -56,16 +56,20 @@ import (
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/smtp"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/emersion/go-imap"
+	imapclient "github.com/emersion/go-imap/client"
 	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 
@@ -79,6 +83,7 @@ import (
 	"github.com/sitehostnz/gosh/pkg/api/dns"
 	"github.com/sitehostnz/gosh/pkg/api/info"
 	"github.com/sitehostnz/gosh/pkg/api/job"
+	"github.com/sitehostnz/gosh/pkg/api/mail"
 	sshKey "github.com/sitehostnz/gosh/pkg/api/ssh/key"
 	"github.com/sitehostnz/gosh/pkg/models"
 )
@@ -112,10 +117,18 @@ type state struct {
 	marker     string // unique string we expect to see served
 
 	// Phase B fields (zero-valued when Phase B doesn't run)
-	domain         string   // BYO test domain or auto-generated gosh-test-<hex>.co.nz
-	dnsRecordIDs   []string // every DNS record we created, for cleanup
-	zoneCreated    bool     // whether we created the DNS zone
+	domain          string   // BYO test domain or auto-generated gosh-test-<hex>.co.nz
+	dnsRecordIDs    []string // every DNS record we created, for cleanup
+	zoneCreated     bool     // whether we created the DNS zone
+	mailDomainAdded bool     // whether mail.AddDomain succeeded
+	mailHostname    string   // SMTP/IMAP hostname from mail.GetServerInfo
+	mailSender      string   // sender@<domain>
+	mailReceiver    string   // receiver@<domain>
+	mailSenderPwd   string
+	mailReceiverPwd string
 }
+
+const mailService = "sth-mail-air"
 
 func main() {
 	// run() returns the exit code; we wrap in main() so deferred
@@ -455,7 +468,185 @@ func runPhaseB(ctx context.Context, c *api.Client, st *state) error {
 	fmt.Printf("  → externally verifiable while it's still up (bypasses public DNS):\n")
 	fmt.Printf("      curl -i http://%s/ --resolve %s:80:%s\n", st.domain, st.domain, st.ccs.PrimaryIP)
 	fmt.Println()
+
+	if err := runPhaseBMail(ctx, c, st); err != nil {
+		return err
+	}
 	return nil
+}
+
+// runPhaseBMail provisions mail on the test domain and verifies
+// SMTP+IMAP loopback. Two accounts (sender, receiver) on the same
+// domain; sender sends to receiver via SMTP submission; we poll
+// IMAP until a message containing our marker arrives. Loopback
+// bypasses public deliverability concerns (DNS, SPF, spam) — proves
+// the SiteHost mail service routes internally.
+func runPhaseBMail(ctx context.Context, c *api.Client, st *state) error {
+	mailClient := mail.New(c)
+	dnsClient := dns.New(c)
+
+	// ── B.5 — register the test domain on the mail service ─────────────
+	if _, err := mailClient.AddDomain(ctx, mail.AddDomainOptions{
+		ServerOptions: mail.ServerOptions{ServerName: mailService},
+		Domain:        st.domain,
+	}); err != nil {
+		return fmt.Errorf("mail.AddDomain: %w", err)
+	}
+	st.mailDomainAdded = true
+	step("B.5", "mail.AddDomain: %s on %s", st.domain, mailService)
+
+	// ── B.6 — get the SMTP/IMAP hostname ───────────────────────────────
+	infoResp, err := mailClient.GetServerInfo(ctx, mail.GetServerInfoOptions{
+		ServerOptions: mail.ServerOptions{ServerName: mailService},
+	})
+	if err != nil {
+		return fmt.Errorf("mail.GetServerInfo: %w", err)
+	}
+	st.mailHostname = infoResp.Return.Hostname
+	step("B.6", "mail.GetServerInfo: hostname=%s webmail=%s",
+		st.mailHostname, infoResp.Return.WebmailURL)
+
+	// ── B.7 — provision sender + receiver accounts ─────────────────────
+	//
+	// Mail provisioning jobs are DaemonType, not SchedulerType. They
+	// also take longer than scheduler jobs (~2-3 min observed).
+	st.mailSender = "sender@" + st.domain
+	st.mailReceiver = "receiver@" + st.domain
+	st.mailSenderPwd = randHex(16) + "Aa1!"
+	st.mailReceiverPwd = randHex(16) + "Aa1!"
+
+	addSender, err := mailClient.AddAccount(ctx, mail.AddAccountOptions{
+		ServerOptions: mail.ServerOptions{ServerName: mailService},
+		Email:         st.mailSender,
+		AccountParams: mail.AccountParams{Password: st.mailSenderPwd, Quota: "100"},
+	})
+	if err != nil {
+		return fmt.Errorf("mail.AddAccount sender: %w", err)
+	}
+	if err := waitForJobOf(ctx, c, addSender.Return.ID, addSender.Return.Type, 5*time.Minute); err != nil {
+		return fmt.Errorf("mail.AddAccount sender job: %w", err)
+	}
+
+	addRecv, err := mailClient.AddAccount(ctx, mail.AddAccountOptions{
+		ServerOptions: mail.ServerOptions{ServerName: mailService},
+		Email:         st.mailReceiver,
+		AccountParams: mail.AccountParams{Password: st.mailReceiverPwd, Quota: "100"},
+	})
+	if err != nil {
+		return fmt.Errorf("mail.AddAccount receiver: %w", err)
+	}
+	if err := waitForJobOf(ctx, c, addRecv.Return.ID, addRecv.Return.Type, 5*time.Minute); err != nil {
+		return fmt.Errorf("mail.AddAccount receiver job: %w", err)
+	}
+	step("B.7", "mail accounts created: %s, %s", st.mailSender, st.mailReceiver)
+
+	// ── B.8 — add MX + SPF records ─────────────────────────────────────
+	mx, err := dnsClient.AddRecord(ctx, dns.AddRecordRequest{
+		Domain: st.domain, Type: "MX", Name: st.domain,
+		Content: st.mailHostname, Priority: "10",
+	})
+	if err != nil {
+		return fmt.Errorf("dns.AddRecord MX: %w", err)
+	}
+	st.dnsRecordIDs = append(st.dnsRecordIDs, mx.Return.ID)
+
+	spf, err := dnsClient.AddRecord(ctx, dns.AddRecordRequest{
+		Domain: st.domain, Type: "TXT", Name: st.domain,
+		Content: "v=spf1 include:_spf.sitehost.co.nz ~all",
+	})
+	if err != nil {
+		return fmt.Errorf("dns.AddRecord TXT: %w", err)
+	}
+	st.dnsRecordIDs = append(st.dnsRecordIDs, spf.Return.ID)
+	step("B.8", "mail DNS records added: MX -> %s, TXT (SPF)", st.mailHostname)
+
+	// ── B.9 — SMTP send + IMAP receive loopback ────────────────────────
+	marker := "gosh-mail-" + randHex(8)
+	if err := smtpSend(st.mailHostname, st.mailSender, st.mailSenderPwd,
+		st.mailReceiver, "Phase B loopback", "Marker: "+marker); err != nil {
+		return fmt.Errorf("smtp send: %w", err)
+	}
+	step("B.9a", "smtp send accepted: %s -> %s (marker=%s)",
+		st.mailSender, st.mailReceiver, marker)
+
+	if err := imapWaitForMessage(st.mailHostname, st.mailReceiver, st.mailReceiverPwd,
+		marker, 60*time.Second); err != nil {
+		return fmt.Errorf("imap wait: %w", err)
+	}
+	step("B.9b", "imap delivery confirmed: marker found in receiver inbox")
+
+	return nil
+}
+
+// smtpSend authenticates as `from` against the SiteHost mail
+// submission service (port 587, STARTTLS) and delivers a message
+// to `to`. Used for the Phase B loopback test — same-domain
+// delivery so MX lookup against public DNS isn't required.
+func smtpSend(hostname, from, password, to, subject, body string) error {
+	addr := net.JoinHostPort(hostname, "587")
+	auth := smtp.PlainAuth("", from, password, hostname)
+	msg := []byte(fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\n",
+		from, to, subject, body))
+	return smtp.SendMail(addr, auth, from, []string{to}, msg)
+}
+
+// imapWaitForMessage connects to IMAPS (port 993), authenticates
+// as the receiver, and polls INBOX until a message containing the
+// marker arrives or the deadline passes.
+func imapWaitForMessage(hostname, user, password, marker string, timeout time.Duration) error {
+	addr := net.JoinHostPort(hostname, "993")
+	deadline := time.Now().Add(timeout)
+	var sleep time.Duration
+	for time.Now().Before(deadline) {
+		found, err := imapHasMarker(addr, hostname, user, password, marker)
+		if err == nil && found {
+			return nil
+		}
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
+	}
+	return fmt.Errorf("marker %q not found in %s INBOX within %s", marker, user, timeout)
+}
+
+func imapHasMarker(addr, serverName, user, password, marker string) (bool, error) {
+	cl, err := imapclient.DialTLS(addr, &tls.Config{ServerName: serverName})
+	if err != nil {
+		return false, err
+	}
+	defer cl.Logout()
+	if err := cl.Login(user, password); err != nil {
+		return false, err
+	}
+	mbox, err := cl.Select("INBOX", true)
+	if err != nil {
+		return false, err
+	}
+	if mbox.Messages == 0 {
+		return false, nil
+	}
+	from := uint32(1)
+	if mbox.Messages > 20 {
+		from = mbox.Messages - 19
+	}
+	seqset := new(imap.SeqSet)
+	seqset.AddRange(from, mbox.Messages)
+	section := &imap.BodySectionName{}
+	items := []imap.FetchItem{section.FetchItem()}
+	messages := make(chan *imap.Message, 20)
+	done := make(chan error, 1)
+	go func() { done <- cl.Fetch(seqset, items, messages) }()
+	for msg := range messages {
+		r := msg.GetBody(section)
+		if r == nil {
+			continue
+		}
+		body, _ := io.ReadAll(r)
+		if strings.Contains(string(body), marker) {
+			<-done
+			return true, nil
+		}
+	}
+	return false, <-done
 }
 
 // getWithHost issues a GET to url with the Host header overridden.
@@ -492,6 +683,35 @@ func getWithHost(ctx context.Context, url, host string, timeout time.Duration) (
 // cleanup tears down everything in reverse order. Each step is best-effort.
 func (st *state) cleanup(ctx context.Context, c *api.Client) {
 	log.Printf("─── Cleanup ───")
+
+	// Phase B mail teardown — accounts, then domain. Done before DNS
+	// records/zone so mail-side cleanup completes while DNS exists.
+	if st.mailDomainAdded {
+		mailClient := mail.New(c)
+		for _, email := range []string{st.mailSender, st.mailReceiver} {
+			if email == "" {
+				continue
+			}
+			resp, err := mailClient.DeleteAccount(ctx, mail.DeleteAccountOptions{
+				ServerOptions: mail.ServerOptions{ServerName: mailService},
+				Email:         email,
+			})
+			if err != nil {
+				log.Printf("⚠ mail.DeleteAccount %s: %v", email, err)
+				continue
+			}
+			_ = waitForJobOf(ctx, c, resp.Return.ID, resp.Return.Type, 5*time.Minute)
+			step("CB.M", "mail account deleted: %s", email)
+		}
+		if _, err := mailClient.DeleteDomain(ctx, mail.DeleteDomainOptions{
+			ServerOptions: mail.ServerOptions{ServerName: mailService},
+			Domain:        st.domain,
+		}); err != nil {
+			log.Printf("⚠ mail.DeleteDomain %s: %v", st.domain, err)
+		} else {
+			step("CB.M2", "mail domain unmapped: %s", st.domain)
+		}
+	}
 
 	// Phase B teardown — DNS records, then zone. Reverse-add order.
 	dnsClient := dns.New(c)
@@ -618,6 +838,22 @@ func (st *state) audit(ctx context.Context, c *api.Client) {
 			}
 		} else {
 			log.Printf("⚠ dns.ListZones for audit: %v", err)
+		}
+	}
+
+	// Phase B mail audit: domain should be gone from mail.list_domains.
+	if st.mailDomainAdded {
+		domains, err := mail.New(c).ListDomains(ctx, mail.ListDomainsOptions{
+			ServerOptions: mail.ServerOptions{ServerName: mailService},
+		})
+		if err == nil {
+			if anyMatch(domains.Return, func(d mail.Domain) bool { return d.Domain == st.domain }) {
+				log.Printf("⚠ mail domain %s still present after cleanup", st.domain)
+			} else {
+				step("DB.2", "mail.ListDomains: our domain absent ✓")
+			}
+		} else {
+			log.Printf("⚠ mail.ListDomains for audit: %v", err)
 		}
 	}
 
@@ -871,12 +1107,23 @@ func nextBackoff(prev time.Duration) time.Duration {
 	return next
 }
 
+// waitForJob polls /job/get for a SchedulerType job. Used after
+// cloud.* writes which queue scheduler jobs.
 func waitForJob(ctx context.Context, c *api.Client, jobID int, timeout time.Duration) error {
+	return waitForJobOf(ctx, c, jobID, job.SchedulerType, timeout)
+}
+
+// waitForJobOf is the explicit-type variant. mail.* writes queue
+// DaemonType jobs (different scheduler from cloud.*); polling the
+// wrong type returns "job does not exist" and waitForJob spins
+// until timeout. Always pass the Type from the originating
+// response (e.g. addAccount.Return.Type) rather than hardcoding.
+func waitForJobOf(ctx context.Context, c *api.Client, jobID int, jobType string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	client := job.New(c)
 	var sleep time.Duration
 	for time.Now().Before(deadline) {
-		resp, err := client.Get(ctx, job.GetRequest{ID: jobID, Type: job.SchedulerType})
+		resp, err := client.Get(ctx, job.GetRequest{ID: jobID, Type: jobType})
 		if err == nil {
 			switch resp.Return.State {
 			case "Completed":
@@ -886,13 +1133,13 @@ func waitForJob(ctx context.Context, c *api.Client, jobID int, timeout time.Dura
 				if msg == "" {
 					msg = resp.Return.State
 				}
-				return fmt.Errorf("job %d failed: %s", jobID, msg)
+				return fmt.Errorf("job %d (%s) failed: %s", jobID, jobType, msg)
 			}
 		}
 		sleep = nextBackoff(sleep)
 		time.Sleep(sleep)
 	}
-	return fmt.Errorf("job %d did not reach a terminal state within %s", jobID, timeout)
+	return fmt.Errorf("job %d (%s) did not reach a terminal state within %s", jobID, jobType, timeout)
 }
 
 // waitForStackQuiescent polls cloud.stack.Get until Pending == nil.

@@ -46,7 +46,11 @@ func main() {
 
 	var rb [4]byte
 	_, _ = rand.Read(rb[:])
-	volName := fmt.Sprintf("gosh-example-vol-%s-%d", hex.EncodeToString(rb[:]), time.Now().Unix())
+	// Volume names have an undocumented max length around ~16
+	// chars — longer names get rejected with a misleading
+	// "letters, numbers, hyphens, underscores" message even when
+	// they only contain those. See docs/open-api-questions.md.
+	volName := fmt.Sprintf("goshv%s", hex.EncodeToString(rb[:]))
 	log.Printf("Using test volume: %s on %s", volName, server)
 
 	if _, err := v.Add(ctx, volume.AddOptions{ServerName: server, VolumeName: volName}); err != nil {

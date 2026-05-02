@@ -51,6 +51,35 @@ isn't documented anywhere I can find — discovered empirically by
 trying variants. The DeleteRequest.Force field on gosh now passes
 this; doc.go should document it explicitly.
 
+## Volume name length limit
+
+`cloud/volume/add.json` rejects volume names with the message
+*"Please specify a volume name with only letters, numbers, hyphens
+and underscores, with at least 3 characters"* — but this also
+fires for names that DO contain only those characters and are well
+above 3 characters. The actual constraint appears to be an
+undocumented max-length (around ~16 chars empirically). The error
+message is misleading.
+
+**Open question:** what is the documented max length for volume
+names? Should the API's error message include it explicitly? The
+current "at least 3" wording leads consumers to assume there's no
+max.
+
+`examples/cloud-volume` works around with `goshv<8hex>` (13 chars).
+
+## Mail forward destination domain validation
+
+`mail/add_forward.json` rejects `.example` and `.test` TLD destinations
+with *"Please specify a valid destination email address"* — even
+though RFC 2606 reserves these explicitly for documentation/test use.
+`example.com` is accepted (also reserved for documentation but on
+allowlists). `examples/mail` uses `example.com` as a workaround.
+
+**Open question:** should the API allowlist the RFC 2606 reserved
+TLDs (`.example`, `.test`, `.invalid`, `.localhost`) since these are
+specifically for examples?
+
 ## CCS minimum-TLS-version read
 
 `cloud/server/update_minimum_tls_version.json` writes the value;

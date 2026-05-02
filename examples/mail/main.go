@@ -57,7 +57,10 @@ func main() {
 	acct := "alice@" + zone
 	aliasSource := "info@" + zone
 	forwardSource := "external@" + zone
-	forwardDest := "remote@elsewhere.example"
+	// SiteHost rejects ".example" / ".test" reserved TLDs even
+	// though RFC 2606 documents them; example.com is also reserved
+	// for documentation but accepted by validators.
+	forwardDest := "remote@example.com"
 
 	log.Printf("Using test zone: %s", zone)
 

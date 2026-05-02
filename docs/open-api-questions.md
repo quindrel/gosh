@@ -97,6 +97,27 @@ planned, or should consumers always treat this field as
 
 ---
 
+## Deferred wrappers (intentionally not implemented)
+
+Endpoints we've deliberately not wrapped because their value to
+gosh consumers is unclear from the public docs. Listed here so the
+gap is visible — if a use case surfaces, promote to a `feat/`
+branch.
+
+### `server/generate_vnc_token`
+
+Returns `{"return": {"token": "xxx..."}}` given `client_id`,
+`name`, `remote_ip`. The docs do not state **where to connect** —
+no VNC host, no port, no websockify/noVNC URL, no protocol
+guidance. A token without a connection target isn't actionable
+from an SDK consumer's perspective.
+
+**Resolution path:** if the connection target is documented (or a
+companion endpoint exists that returns it), wrap both together.
+Until then, deferred.
+
+---
+
 ## Process
 
 When something else surfaces while writing an example or wrapper,

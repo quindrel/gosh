@@ -551,9 +551,11 @@ func runPhaseBRegister(ctx context.Context, c *api.Client, st *state) error {
 	//
 	// Same contact for all four roles is the simplest path; the API
 	// accepts identical IDs for registrant/admin/technical/billing.
+	// Term is in MONTHS. .nz registry minimum is 12 months — sending
+	// Term=1 fails with "must be registered for a minimum of 12 months".
 	regResp, err := srsClient.CreateDomain(ctx, srs.CreateDomainOptions{
 		Domain:            st.domain,
-		Term:              1,
+		Term:              12,
 		RegistrantContact: id,
 		AdminContact:      id,
 		TechnicalContact:  id,

@@ -7,8 +7,12 @@ type (
 	}
 
 	// DeleteRequest represents a request to delete a Server.
+	// Force=true sends force_delete=1 — required to delete a CCS
+	// that has containers, databases, or users still present
+	// (e.g. the auto-deployed infra stack on a fresh CCS).
 	DeleteRequest struct {
-		Name string `json:"name"`
+		Name  string `json:"name"`
+		Force bool   `json:"-"`
 	}
 
 	// UpgradeRequest represents a request to upgrade a Server.

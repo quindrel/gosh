@@ -57,7 +57,11 @@ import (
 const (
 	location    = "AKLCITY"
 	productCode = "CLDCON4-P" // Performance Cloud Container - 4 Core; matches ch-faraday
-	imageCode   = "ubuntu-focal.amd64.cloud.3002-2"
+	// New CCS naming: ubuntu-cc-<release>-<YYYYMMDD>. Not surfaced by
+	// server.list_images — only the older ubuntu-<release>.amd64.cloud
+	// variants appear there. This one was found via internal scheduler
+	// table lookup; SDK consumers will need it parameterised.
+	imageCode = "ubuntu-cc-2404-20260323"
 )
 
 func main() {
@@ -99,13 +103,15 @@ func main() {
 			log.Printf("- JOURNEY_KEEP=1 — leaving CCS %s in place at %s", newName, ipAddr)
 			return
 		}
-		// Delete the probe CCS via gosh.
+		// Delete the probe CCS via gosh — Force=true because a fresh
+		// CCS auto-deploys the infra stack (collectd, nginx-proxy)
+		// and plain delete refuses while containers exist.
 		log.Printf("─── cleanup ───")
-		if _, err := srvClient.Delete(ctx, server.DeleteRequest{Name: newName}); err != nil {
+		if _, err := srvClient.Delete(ctx, server.DeleteRequest{Name: newName, Force: true}); err != nil {
 			log.Printf("⚠ server.Delete %s: %v", newName, err)
 			return
 		}
-		log.Printf("✓ delete queued for %s", newName)
+		log.Printf("✓ delete queued for %s (force=true)", newName)
 	}()
 
 	// 3. Wait for provision job to complete.

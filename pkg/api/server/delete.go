@@ -14,11 +14,15 @@ func (s *Client) Delete(ctx context.Context, request DeleteRequest) (response De
 	keys := []string{
 		"client_id",
 		"name",
+		"force_delete",
 	}
 
 	values := url.Values{}
 	values.Add("client_id", s.client.ClientID)
 	values.Add("name", request.Name)
+	if request.Force {
+		values.Add("force_delete", "1")
+	}
 
 	req, err := s.client.NewRequest("POST", u, net.Encode(values, keys))
 	if err != nil {

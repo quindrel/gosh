@@ -83,8 +83,10 @@ import (
 	"github.com/sitehostnz/gosh/pkg/api/dns"
 	"github.com/sitehostnz/gosh/pkg/api/info"
 	"github.com/sitehostnz/gosh/pkg/api/job"
+	"github.com/sitehostnz/gosh/pkg/api/cloud/stack/ssl/letsencrypt"
 	"github.com/sitehostnz/gosh/pkg/api/mail"
 	sshKey "github.com/sitehostnz/gosh/pkg/api/ssh/key"
+	"github.com/sitehostnz/gosh/pkg/api/srs"
 	"github.com/sitehostnz/gosh/pkg/models"
 )
 
@@ -126,6 +128,11 @@ type state struct {
 	mailReceiver    string   // receiver@<domain>
 	mailSenderPwd   string
 	mailReceiverPwd string
+
+	// Phase B v3 fields (zero-valued unless JOURNEY_REGISTER_DOMAIN=1)
+	registerDomain   bool // user opted into SRS register/cancel
+	domainRegistered bool // SRS registration succeeded
+	leCertCreated    bool // Let's Encrypt cert was issued
 }
 
 const mailService = "sth-mail-air"
@@ -172,6 +179,12 @@ func run() int {
 	// Phase A runs.
 	if domain := os.Getenv("JOURNEY_DOMAIN"); domain != "" {
 		st.domain = domain
+	} else if os.Getenv("JOURNEY_REGISTER_DOMAIN") == "1" {
+		// Auto-generated unique .co.nz that we'll register via SRS,
+		// run the full Phase B against (including LE since it's
+		// publicly delegated), then cancel inside the .nz 5-day grace.
+		st.domain = "gosh-journey-" + randHex(8) + ".co.nz"
+		st.registerDomain = true
 	} else if os.Getenv("JOURNEY_PHASE_B") == "1" {
 		st.domain = "gosh-test-" + randHex(8) + ".co.nz"
 	}
@@ -393,11 +406,21 @@ func runPhaseA(ctx context.Context, c *api.Client, st *state) error {
 }
 
 // runPhaseB runs against a Phase B test domain (st.domain), already
-// folded into Phase A's stack VIRTUAL_HOST. v1: DNS hosting + records
-// only. Mail provisioning, SMTP/IMAP loopback, and Let's Encrypt are
-// follow-up commits.
+// folded into Phase A's stack VIRTUAL_HOST. Covers DNS hosting,
+// mail provisioning + SMTP/IMAP loopback, and (when
+// JOURNEY_REGISTER_DOMAIN=1) SRS register/cancel + Let's Encrypt.
 func runPhaseB(ctx context.Context, c *api.Client, st *state) error {
-	log.Printf("─── Phase B (domain=%s) ───", st.domain)
+	log.Printf("─── Phase B (domain=%s, register=%v) ───", st.domain, st.registerDomain)
+
+	// ── B.0 — SRS register (only when JOURNEY_REGISTER_DOMAIN=1) ───────
+	//
+	// Done first so the rest of Phase B has a publicly-resolvable
+	// domain — required for LE's HTTP-01 challenge later.
+	if st.registerDomain {
+		if err := runPhaseBRegister(ctx, c, st); err != nil {
+			return err
+		}
+	}
 
 	dnsClient := dns.New(c)
 
@@ -472,7 +495,135 @@ func runPhaseB(ctx context.Context, c *api.Client, st *state) error {
 	if err := runPhaseBMail(ctx, c, st); err != nil {
 		return err
 	}
+
+	// ── B.10 — Let's Encrypt (only when register mode, since LE's ────
+	// HTTP-01 challenge needs the domain publicly delegated) ─────────
+	if st.registerDomain {
+		if err := runPhaseBLetsEncrypt(ctx, c, st); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// runPhaseBRegister registers the test domain via SRS, then waits
+// for it to become Active. Real-money path: cancel inside the .nz
+// 5-day grace to avoid billing.
+func runPhaseBRegister(ctx context.Context, c *api.Client, st *state) error {
+	srsClient := srs.New(c)
+
+	// ── B.0a — pre-flight ──────────────────────────────────────────────
+	whois, err := srsClient.Whois(ctx, srs.WhoisOptions{Domain: st.domain})
+	if err != nil {
+		return fmt.Errorf("srs.Whois: %w", err)
+	}
+	if whois.Return.State == "Active" {
+		return fmt.Errorf("srs.Whois: %s already registered (state=Active)", st.domain)
+	}
+	step("B.0a", "srs.Whois: %s available (state=%s)", st.domain, whois.Return.State)
+
+	avail, err := srsClient.DomainAvailable(ctx, srs.DomainAvailableOptions{Domain: st.domain})
+	if err != nil {
+		return fmt.Errorf("srs.DomainAvailable: %w", err)
+	}
+	if !avail.Return {
+		return fmt.Errorf("srs.DomainAvailable: %s not available", st.domain)
+	}
+	step("B.0b", "srs.DomainAvailable: %s available ✓", st.domain)
+
+	// ── B.0c — discover contact IDs from the account ───────────────────
+	contacts, err := srsClient.ListContacts(ctx)
+	if err != nil {
+		return fmt.Errorf("srs.ListContacts: %w", err)
+	}
+	if len(contacts.Return) == 0 {
+		return fmt.Errorf("srs.ListContacts: no contacts on account; create one before running register mode")
+	}
+	contactID := contacts.Return[0].ContactID
+	id, err := atoi(contactID)
+	if err != nil {
+		return fmt.Errorf("invalid contact_id %q: %w", contactID, err)
+	}
+	step("B.0c", "srs.ListContacts: using contact_id=%d (%s)", id, contacts.Return[0].Name)
+
+	// ── B.0d — register ────────────────────────────────────────────────
+	//
+	// Same contact for all four roles is the simplest path; the API
+	// accepts identical IDs for registrant/admin/technical/billing.
+	regResp, err := srsClient.CreateDomain(ctx, srs.CreateDomainOptions{
+		Domain:            st.domain,
+		Term:              1,
+		RegistrantContact: id,
+		AdminContact:      id,
+		TechnicalContact:  id,
+		BillingContact:    id,
+	})
+	if err != nil {
+		return fmt.Errorf("srs.CreateDomain: %w", err)
+	}
+	if err := waitForJobOf(ctx, c, regResp.Return.ID, regResp.Return.Type, 10*time.Minute); err != nil {
+		return fmt.Errorf("srs.CreateDomain job: %w", err)
+	}
+	st.domainRegistered = true
+	step("B.0d", "srs.CreateDomain: %s registered ✓ (cancel within 5 days for refund)", st.domain)
+
+	// ── B.0e — confirm Active ──────────────────────────────────────────
+	dom, err := srsClient.GetDomain(ctx, srs.DomainOptions{Domain: st.domain})
+	if err != nil {
+		return fmt.Errorf("srs.GetDomain: %w", err)
+	}
+	step("B.0e", "srs.GetDomain: state=%s", dom.Return.State)
+	return nil
+}
+
+// runPhaseBLetsEncrypt issues an LE cert for the registered domain
+// via the cloud.stack.ssl.lets_encrypt.* surface, then verifies the
+// HTTPS connection lands on a Let's Encrypt cert.
+func runPhaseBLetsEncrypt(ctx context.Context, c *api.Client, st *state) error {
+	leClient := letsencrypt.New(c)
+
+	// ── B.10a — request the cert ───────────────────────────────────────
+	//
+	// HTTP-01 challenge runs against the stack's nginx-proxy vhost.
+	// Requires the domain to publicly resolve to the CCS IP — which
+	// it does, since SiteHost is the registrar AND DNS host for our
+	// just-registered domain.
+	createResp, err := leClient.Create(ctx, letsencrypt.CreateRequest{
+		ServerName: st.ccs.Name,
+		Name:       st.stackName,
+	})
+	if err != nil {
+		return fmt.Errorf("letsencrypt.Create: %w", err)
+	}
+	if err := waitForJobOf(ctx, c, createResp.Return.ID, createResp.Return.Type, 10*time.Minute); err != nil {
+		return fmt.Errorf("letsencrypt.Create job: %w", err)
+	}
+	st.leCertCreated = true
+	step("B.10a", "Let's Encrypt cert issued for %s", st.domain)
+
+	// ── B.10b — verify HTTPS handshake lands on LE cert ────────────────
+	body, err := waitForHTTP(ctx, "https://"+st.domain+"/", 60*time.Second)
+	if err != nil {
+		return fmt.Errorf("https verify: %w", err)
+	}
+	if !strings.Contains(body, st.marker) {
+		return fmt.Errorf("https response missing marker %q", st.marker)
+	}
+	step("B.10b", "HTTPS served marker %s on Let's Encrypt cert", st.marker)
+	return nil
+}
+
+// atoi is strconv.Atoi, factored out so the call site reads tighter.
+func atoi(s string) (int, error) {
+	var n int
+	for _, ch := range s {
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("not a number: %q", s)
+		}
+		n = n*10 + int(ch-'0')
+	}
+	return n, nil
 }
 
 // runPhaseBMail provisions mail on the test domain and verifies
@@ -684,6 +835,19 @@ func getWithHost(ctx context.Context, url, host string, timeout time.Duration) (
 func (st *state) cleanup(ctx context.Context, c *api.Client) {
 	log.Printf("─── Cleanup ───")
 
+	// Phase B v3 LE teardown (only if cert was created).
+	if st.leCertCreated {
+		resp, err := letsencrypt.New(c).Delete(ctx, letsencrypt.DeleteRequest{
+			ServerName: st.ccs.Name, Name: st.stackName,
+		})
+		if err != nil {
+			log.Printf("⚠ letsencrypt.Delete: %v", err)
+		} else {
+			_ = waitForJobOf(ctx, c, resp.Return.ID, resp.Return.Type, 5*time.Minute)
+			step("CB.LE", "Let's Encrypt cert deleted")
+		}
+	}
+
 	// Phase B mail teardown — accounts, then domain. Done before DNS
 	// records/zone so mail-side cleanup completes while DNS exists.
 	if st.mailDomainAdded {
@@ -819,6 +983,20 @@ func (st *state) cleanup(ctx context.Context, c *api.Client) {
 			log.Printf("⚠ ssh.key.Delete %s: %v", st.keyID, err)
 		} else {
 			step("C.5", "ssh.key deleted: id=%s", st.keyID)
+		}
+	}
+
+	// Phase B v3 SRS cancel — last, after all dependent state is gone.
+	// Inside the .nz 5-day grace window, cancellation is unbilled.
+	// OUTSIDE that window, the registry will bill — the warning log
+	// below is intentionally loud.
+	if st.domainRegistered {
+		resp, err := srs.New(c).CancelDomain(ctx, srs.DomainOptions{Domain: st.domain})
+		if err != nil {
+			log.Printf("⚠ srs.CancelDomain %s: %v — REAL DOMAIN MAY BILL OUTSIDE 5-DAY GRACE", st.domain, err)
+		} else {
+			_ = waitForJobOf(ctx, c, resp.Return.ID, resp.Return.Type, 5*time.Minute)
+			step("CB.SRS", "srs.CancelDomain: %s (within .nz 5-day grace; refunded)", st.domain)
 		}
 	}
 }

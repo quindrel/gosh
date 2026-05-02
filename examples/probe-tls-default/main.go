@@ -42,7 +42,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"time"
@@ -51,6 +50,7 @@ import (
 	"github.com/sitehostnz/gosh/pkg/api/info"
 	"github.com/sitehostnz/gosh/pkg/api/job"
 	pnet "github.com/sitehostnz/gosh/pkg/net"
+	cloudServer "github.com/sitehostnz/gosh/pkg/api/cloud/server"
 	"github.com/sitehostnz/gosh/pkg/api/server"
 )
 
@@ -240,32 +240,15 @@ func summariseTLSErr(err error) string {
 	return s
 }
 
-// setMinTLS calls cloud/server/update_minimum_tls_version.json on
-// the named CCS. TODO(gosh:cloud-server-config): wrap this in a
-// proper cloud/server package operation, then drop this raw call.
+// setMinTLS — uses the gosh wrapper added in feat/cloud-server-config.
 func setMinTLS(c *api.Client, serverName, version string) error {
-	values := url.Values{}
-	values.Add("client_id", c.ClientID)
-	values.Add("server_name", serverName)
-	values.Add("minimum_tls_version", version)
-	body := pnet.Encode(values, []string{"client_id", "server_name", "minimum_tls_version"})
-	req, err := c.NewRequest("POST", "cloud/server/update_minimum_tls_version.json", body)
+	resp, err := cloudServer.New(c).UpdateMinimumTLSVersion(context.Background(),
+		cloudServer.UpdateMinimumTLSVersionRequest{
+			ServerName:        serverName,
+			MinimumTLSVersion: version,
+		})
 	if err != nil {
 		return err
-	}
-	var resp struct {
-		Return struct {
-			ID   int    `json:"id"`
-			Type string `json:"type"`
-		} `json:"return"`
-		Status bool   `json:"status"`
-		Msg    string `json:"msg"`
-	}
-	if err := c.Do(context.Background(), req, &resp); err != nil {
-		return err
-	}
-	if !resp.Status {
-		return fmt.Errorf("API: %s", resp.Msg)
 	}
 	if resp.Return.ID > 0 {
 		return waitForJob(context.Background(), c, resp.Return.ID, resp.Return.Type, 5*time.Minute)

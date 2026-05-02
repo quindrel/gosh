@@ -42,9 +42,11 @@
 // "resource not found", because the resource hasn't actually been
 // created yet.
 //
-// Synchronous writes (e.g. cloud.ssh.user.Add) return without a job;
-// the operation is complete on response. Read endpoints are likewise
-// synchronous.
+// Reads are synchronous (no job in the response). Every async write
+// — including cloud.ssh.user.Add and cloud.ssh.user.Delete which
+// embed a job in their response — must wait. Audit endpoints
+// (List, Get) may show stale state for tens of seconds if the
+// preceding write's job hasn't been polled to Completed.
 //
 // Required env: SH_API_KEY
 // Optional env: SH_CLIENT_ID (skip discovery), JOURNEY_KEEP=1 (skip cleanup)
@@ -281,14 +283,18 @@ func runPhaseA(ctx context.Context, c *api.Client, st *state) error {
 	// public-key content. Containers scopes the SSH user; SSH login
 	// lands them inside our www container's volume mounts.
 	st.sshUser = "g" + randHex(7) // SSH username length-limited
-	if _, err := cloudSSHUser.New(c).Add(ctx, cloudSSHUser.AddRequest{
+	addSSHUser, err := cloudSSHUser.New(c).Add(ctx, cloudSSHUser.AddRequest{
 		ServerName:     st.ccs.Name,
 		Username:       st.sshUser,
 		Containers:     []string{st.stackName},
 		SSHKeys:        []string{st.keyID},
 		ReadOnlyConfig: false,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("cloud.ssh.user.Add: %w", err)
+	}
+	if err := waitForJob(ctx, c, addSSHUser.Return.ID, 2*time.Minute); err != nil {
+		return fmt.Errorf("cloud.ssh.user.Add job: %w", err)
 	}
 	step("A.8", "ssh user created: %s scoped to container=%s", st.sshUser, st.stackName)
 
@@ -346,11 +352,13 @@ func (st *state) cleanup(ctx context.Context, c *api.Client) {
 	log.Printf("─── Cleanup ───")
 
 	if st.sshUser != "" && st.ccs.Name != "" {
-		if _, err := cloudSSHUser.New(c).Delete(ctx, cloudSSHUser.DeleteRequest{
+		resp, err := cloudSSHUser.New(c).Delete(ctx, cloudSSHUser.DeleteRequest{
 			ServerName: st.ccs.Name, Username: st.sshUser,
-		}); err != nil {
+		})
+		if err != nil {
 			log.Printf("⚠ cloud.ssh.user.Delete %s: %v", st.sshUser, err)
 		} else {
+			_ = waitForJob(ctx, c, resp.Return.ID, 2*time.Minute)
 			step("C.1", "cloud.ssh.user deleted: %s", st.sshUser)
 		}
 	}
@@ -380,26 +388,18 @@ func (st *state) cleanup(ctx context.Context, c *api.Client) {
 	}
 
 	if st.stackName != "" && st.ccs.Name != "" {
-		// Stacks can have a per-stack "job already running" lock that
-		// lingers briefly after the previous job's state=Completed.
-		// gosh's models.Stack doesn't expose the `pending` field that
-		// would let us poll for quiescence directly, so retry briefly
-		// on the specific error instead.
-		var resp cloudStack.JobResponse
-		var err error
-		deadline := time.Now().Add(60 * time.Second)
-		for {
-			resp, err = cloudStack.New(c).Delete(ctx, cloudStack.DeleteRequest{
-				ServerName: st.ccs.Name, Name: st.stackName,
-			})
-			if err == nil || !strings.Contains(err.Error(), "job already running on this stack") {
-				break
-			}
-			if time.Now().After(deadline) {
-				break
-			}
-			time.Sleep(3 * time.Second)
+		// Wait for the stack to be quiescent before issuing Delete.
+		// models.Stack exposes Pending; polling Get and waiting until
+		// Pending == nil is more correct than retry-on-error against
+		// the "job already running on this stack" message — we observe
+		// the actual resource state rather than guessing from an error
+		// string.
+		if err := waitForStackQuiescent(ctx, c, st.ccs.Name, st.stackName, 60*time.Second); err != nil {
+			log.Printf("⚠ stack %s did not become quiescent: %v", st.stackName, err)
 		}
+		resp, err := cloudStack.New(c).Delete(ctx, cloudStack.DeleteRequest{
+			ServerName: st.ccs.Name, Name: st.stackName,
+		})
 		if err != nil {
 			log.Printf("⚠ cloud.stack.Delete %s: %v", st.stackName, err)
 		} else {
@@ -568,12 +568,14 @@ func sshExec(host, user string, priv ed25519.PrivateKey, cmd string) (string, er
 	addr := net.JoinHostPort(host, "22")
 	var sshClient *gossh.Client
 	deadline := time.Now().Add(60 * time.Second)
+	var sleep time.Duration
 	for time.Now().Before(deadline) {
 		sshClient, err = gossh.Dial("tcp", addr, cfg)
 		if err == nil {
 			break
 		}
-		time.Sleep(3 * time.Second)
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
 	}
 	if err != nil {
 		return "", err
@@ -606,12 +608,14 @@ func sftpUpload(host, user string, priv ed25519.PrivateKey, remotePath, content 
 	addr := net.JoinHostPort(host, "22")
 	var sshClient *gossh.Client
 	deadline := time.Now().Add(60 * time.Second)
+	var sleep time.Duration
 	for time.Now().Before(deadline) {
 		sshClient, err = gossh.Dial("tcp", addr, cfg)
 		if err == nil {
 			break
 		}
-		time.Sleep(3 * time.Second)
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
 	}
 	if err != nil {
 		return fmt.Errorf("ssh.Dial %s as %s: %w", addr, user, err)
@@ -635,45 +639,84 @@ func sftpUpload(host, user string, priv ed25519.PrivateKey, remotePath, content 
 	return nil
 }
 
+// nextBackoff returns the next sleep in an exponential backoff
+// sequence: 1s → 2s → 4s → 8s → 10s cap. Bounded to keep
+// long-running provisions from spamming the API at flat-rate
+// intervals (a 5min job would hit /job/get ~100 times at flat 3s).
+func nextBackoff(prev time.Duration) time.Duration {
+	if prev == 0 {
+		return 1 * time.Second
+	}
+	next := prev * 2
+	if next > 10*time.Second {
+		return 10 * time.Second
+	}
+	return next
+}
+
 func waitForJob(ctx context.Context, c *api.Client, jobID int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	client := job.New(c)
+	var sleep time.Duration
 	for time.Now().Before(deadline) {
 		resp, err := client.Get(ctx, job.GetRequest{ID: jobID, Type: job.SchedulerType})
-		if err != nil {
-			time.Sleep(3 * time.Second)
-			continue
+		if err == nil {
+			switch resp.Return.State {
+			case "Completed":
+				return nil
+			case "Failed":
+				msg := resp.Return.Message
+				if msg == "" {
+					msg = resp.Return.State
+				}
+				return fmt.Errorf("job %d failed: %s", jobID, msg)
+			}
 		}
-		switch resp.Return.State {
-		case "Completed":
-			return nil
-		case "Failed":
-			return fmt.Errorf("job %d failed (state=%s)", jobID, resp.Return.State)
-		}
-		time.Sleep(3 * time.Second)
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
 	}
 	return fmt.Errorf("job %d did not reach a terminal state within %s", jobID, timeout)
+}
+
+// waitForStackQuiescent polls cloud.stack.Get until Pending == nil.
+// Use this before any dependent write that touches the same stack:
+// the per-stack "job already running" semaphore lingers briefly
+// after the previous job's state=Completed.
+func waitForStackQuiescent(ctx context.Context, c *api.Client, server, name string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := cloudStack.New(c)
+	var sleep time.Duration
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(ctx, cloudStack.GetRequest{ServerName: server, Name: name})
+		if err == nil && resp.Stack.Pending == nil {
+			return nil
+		}
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
+	}
+	return fmt.Errorf("stack %s/%s did not become quiescent within %s", server, name, timeout)
 }
 
 func waitForHTTP(ctx context.Context, url string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 10 * time.Second}
 	var lastErr error
+	var sleep time.Duration
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
-			time.Sleep(3 * time.Second)
-			continue
+		} else {
+			body, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == 200 {
+				return string(body), nil
+			}
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
 		}
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if resp.StatusCode == 200 {
-			return string(body), nil
-		}
-		lastErr = fmt.Errorf("status %d", resp.StatusCode)
-		time.Sleep(3 * time.Second)
+		sleep = nextBackoff(sleep)
+		time.Sleep(sleep)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("timed out")

@@ -55,4 +55,171 @@ type (
 	UpgradeResponse struct {
 		models.APIResponse
 	}
+
+	// LastJob is a brief summary of the most recent job affecting a
+	// server, returned by get_state.
+	LastJob struct {
+		ID    string `json:"id"`
+		Type  string `json:"type"`
+		State string `json:"state"`
+	}
+
+	// ServerState is the runtime state of a server.
+	ServerState struct {
+		State   string  `json:"state"`
+		Rescue  bool    `json:"rescue"`
+		LastJob LastJob `json:"last_job"`
+	}
+
+	// GetStateResponse represents the response from get_state.
+	GetStateResponse struct {
+		Return ServerState `json:"return"`
+		models.APIResponse
+	}
+
+	// Image is a server image entry from list_images.
+	Image struct {
+		Name   string `json:"name"`
+		Code   string `json:"code"`
+		Arch   string `json:"arch"`
+		Distro string `json:"distro"`
+		Type   string `json:"type"`
+		OS     string `json:"os"`
+	}
+
+	// ListImagesResponse represents the response from list_images.
+	ListImagesResponse struct {
+		Return []Image `json:"return"`
+		models.APIResponse
+	}
+
+	// Location is a datacenter location entry from list_locations.
+	// Public is returned as a string flag ("0"/"1") by the API.
+	Location struct {
+		Public             string   `json:"public"`
+		OS                 []string `json:"os"`
+		Label              string   `json:"label"`
+		Code               string   `json:"code"`
+		Datacenter         string   `json:"datacenter"`
+		AvailableIPs       int      `json:"available_ips"`
+		AvailableIPv4      int      `json:"available_ipv4"`
+		AvailableIPv6      int      `json:"available_ipv6"`
+		IPv6               bool     `json:"ipv6"`
+		PublicPrivateCloud bool     `json:"public_private_cloud"`
+		ProductTypes       []string `json:"product_types"`
+	}
+
+	// ListLocationsResponse represents the response from list_locations.
+	ListLocationsResponse struct {
+		Return []Location `json:"return"`
+		models.APIResponse
+	}
+
+	// ResourceQuota is a single quota entry inside a resource group.
+	// TotalUnits and UsedUnits are returned as strings; AvailableUnits
+	// is returned as a number (and may be negative when over-quota).
+	ResourceQuota struct {
+		AttributeID    string   `json:"attribute_id"`
+		AttributeName  string   `json:"attribute_name"`
+		AttributeUnit  string   `json:"attribute_unit"`
+		AttributeType  string   `json:"attribute_type"`
+		TotalUnits     string   `json:"total_units"`
+		UsedUnits      string   `json:"used_units"`
+		AvailableUnits int      `json:"available_units"`
+		Objects        []string `json:"objects"`
+	}
+
+	// ResourceGroup represents a per-client resource quota group from
+	// list_resources.
+	ResourceGroup struct {
+		ClientID  string          `json:"client_id"`
+		GroupID   string          `json:"group_id"`
+		GroupName string          `json:"group_name"`
+		Quotas    []ResourceQuota `json:"quotas"`
+	}
+
+	// ListResourcesResponse represents the response from list_resources.
+	ListResourcesResponse struct {
+		Return []ResourceGroup `json:"return"`
+		models.APIResponse
+	}
+
+	// QuotaUsage is a total/used pair returned within UpgradeQuota.
+	QuotaUsage struct {
+		Total int `json:"total"`
+		Used  int `json:"used"`
+	}
+
+	// UpgradeQuota is the overall quota / usage block from list_upgrades.
+	UpgradeQuota struct {
+		RAM   QuotaUsage `json:"ram"`
+		Disk  QuotaUsage `json:"disk"`
+		Cores QuotaUsage `json:"cores"`
+	}
+
+	// ExtraDiskOption is the per-unit price/size offered for additional
+	// disk capacity.
+	ExtraDiskOption struct {
+		Price float64 `json:"price"`
+		Size  int     `json:"size"`
+	}
+
+	// DiskUpgradeOptions is the per-disk-slot list of included and
+	// available extra disk sizes.
+	DiskUpgradeOptions struct {
+		Included []int `json:"included"`
+		Extra    []int `json:"extra"`
+	}
+
+	// Upgrades is the upgrade-availability information for a server.
+	// The Disk map is keyed by disk slot identifier (e.g. "scsi0").
+	Upgrades struct {
+		Quota     UpgradeQuota                  `json:"quota"`
+		ExtraDisk ExtraDiskOption               `json:"extra-disk"`
+		Disk      map[string]DiskUpgradeOptions `json:"disk"`
+	}
+
+	// ListUpgradesResponse represents the response from list_upgrades.
+	ListUpgradesResponse struct {
+		Return Upgrades `json:"return"`
+		models.APIResponse
+	}
+
+	// GenerateNetworkConfigResponse represents the response from
+	// generate_network_config. The Return map is keyed by file path
+	// (e.g. "/etc/netplan/50-cloud-init.yaml") with file contents
+	// as the value.
+	GenerateNetworkConfigResponse struct {
+		Return map[string]string `json:"return"`
+		models.APIResponse
+	}
+
+	// IPJobResponse represents the shared response from add_ip and
+	// remove_ip — a scheduler job plus the IP address that was
+	// affected.
+	IPJobResponse struct {
+		Return struct {
+			models.Job `json:"job"`
+			IPAddr     string `json:"ip_addr"`
+		} `json:"return"`
+		models.APIResponse
+	}
+
+	// SetPrimaryIPResponse represents the synchronous response
+	// from set_primary_ip.
+	SetPrimaryIPResponse struct {
+		Return struct {
+			IPAddr string `json:"ip_addr"`
+		} `json:"return"`
+		models.APIResponse
+	}
+
+	// ChangeStateResponse represents the response from
+	// change_state — a scheduler job for the state transition.
+	ChangeStateResponse struct {
+		Return struct {
+			models.Job `json:"job"`
+		} `json:"return"`
+		models.APIResponse
+	}
 )

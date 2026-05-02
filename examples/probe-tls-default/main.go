@@ -56,12 +56,14 @@ import (
 
 const (
 	location    = "AKLCITY"
-	productCode = "CLDCON4-P" // Performance Cloud Container - 4 Core; matches ch-faraday
+	productCode = "CLDCON4-P" // Performance Cloud Container - 4 Core
+
 	// New CCS naming: ubuntu-cc-<release>-<YYYYMMDD>. Not surfaced by
 	// server.list_images — only the older ubuntu-<release>.amd64.cloud
-	// variants appear there. This one was found via internal scheduler
-	// table lookup; SDK consumers will need it parameterised.
-	imageCode = "ubuntu-cc-2404-20260323"
+	// variants appear there. Found via internal scheduler-table lookup.
+	// Override via JOURNEY_IMAGE env var when the date suffix changes.
+	// See docs/open-api-questions.md "CCS image catalogue".
+	defaultImageCode = "ubuntu-cc-2404-20260323"
 )
 
 func main() {
@@ -87,7 +89,7 @@ func main() {
 		Label:       "gosh-tls-default-probe-" + tsString(),
 		Location:    location,
 		ProductCode: productCode,
-		Image:       imageCode,
+		Image:       imageCodeFromEnv(),
 		Params:      server.ParamsOptions{IPv4: []string{ipAddr}},
 	})
 	if err != nil {
@@ -272,6 +274,13 @@ func setMinTLS(c *api.Client, serverName, version string) error {
 }
 
 func tsString() string { return strconv.FormatInt(time.Now().Unix(), 10) }
+
+func imageCodeFromEnv() string {
+	if v := os.Getenv("JOURNEY_IMAGE"); v != "" {
+		return v
+	}
+	return defaultImageCode
+}
 
 // rawFirstFreeIP — inline call to server/list_ips.json. Swap to
 // gosh's server.ListIPs once feat/server-reads-extras is on this

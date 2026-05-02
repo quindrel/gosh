@@ -352,14 +352,38 @@ func (st *state) cleanup(ctx context.Context, c *api.Client) {
 	log.Printf("─── Cleanup ───")
 
 	if st.sshUser != "" && st.ccs.Name != "" {
-		resp, err := cloudSSHUser.New(c).Delete(ctx, cloudSSHUser.DeleteRequest{
-			ServerName: st.ccs.Name, Username: st.sshUser,
-		})
-		if err != nil {
-			log.Printf("⚠ cloud.ssh.user.Delete %s: %v", st.sshUser, err)
-		} else {
+		// cloud.ssh.user.Delete appears to be two-phase server-side:
+		// the first call clears the user's container/volume scoping
+		// (Get afterward shows containers=[] volumes=[], user still
+		// present); a second call fully removes the user account.
+		// Loop Delete + waitForJob until Get returns error ("does
+		// not exist"), with a deadline so a real bug doesn't hang.
+		client := cloudSSHUser.New(c)
+		deadline := time.Now().Add(60 * time.Second)
+		var sleep time.Duration
+		gone := false
+		for time.Now().Before(deadline) {
+			if _, gErr := client.Get(ctx, cloudSSHUser.GetRequest{
+				ServerName: st.ccs.Name, Username: st.sshUser,
+			}); gErr != nil {
+				gone = true
+				break
+			}
+			resp, err := client.Delete(ctx, cloudSSHUser.DeleteRequest{
+				ServerName: st.ccs.Name, Username: st.sshUser,
+			})
+			if err != nil {
+				log.Printf("⚠ cloud.ssh.user.Delete %s: %v", st.sshUser, err)
+				break
+			}
 			_ = waitForJob(ctx, c, resp.Return.ID, 2*time.Minute)
+			sleep = nextBackoff(sleep)
+			time.Sleep(sleep)
+		}
+		if gone {
 			step("C.1", "cloud.ssh.user deleted: %s", st.sshUser)
+		} else {
+			log.Printf("⚠ cloud.ssh.user %s not gone after 60s of Delete loop", st.sshUser)
 		}
 	}
 
@@ -451,14 +475,18 @@ func (st *state) audit(ctx context.Context, c *api.Client) {
 		log.Printf("⚠ cloud.db.user.List for audit: %v", err)
 	}
 
-	if users, err := cloudSSHUser.New(c).List(ctx, cloudSSHUser.ListOptions{ServerName: st.ccs.Name}); err == nil {
-		if anyMatch(users.Return.Users, func(u models.User) bool { return u.Username == st.sshUser }) {
-			log.Printf("⚠ ssh user %s still present after cleanup", st.sshUser)
-		} else {
-			step("D.4", "cloud.ssh.user.List: our user absent ✓")
-		}
+	// SSH user audit uses Get rather than List. List has a stale
+	// cache that lingers ~15-30s after delete — the user appears in
+	// the list well after cloud.ssh.user.Delete's job state=Completed.
+	// Get reflects the underlying state immediately (returns an error
+	// once the user is gone), so it's the right primitive for an
+	// "is it gone" check.
+	if _, err := cloudSSHUser.New(c).Get(ctx, cloudSSHUser.GetRequest{
+		ServerName: st.ccs.Name, Username: st.sshUser,
+	}); err != nil {
+		step("D.4", "cloud.ssh.user.Get: our user absent ✓")
 	} else {
-		log.Printf("⚠ cloud.ssh.user.List for audit: %v", err)
+		log.Printf("⚠ ssh user %s still present after cleanup", st.sshUser)
 	}
 
 	if keys, err := sshKey.New(c).List(ctx); err == nil {

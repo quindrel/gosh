@@ -118,6 +118,71 @@ Until then, deferred.
 
 ---
 
+## Custom-image GitLab — undocumented network restrictions
+
+Public docs (`https://kb.sitehost.nz/cloud-containers/custom-images/`)
+present `git clone git@gitlab-clients.sitehost.co.nz:g_<id>/<code>.git`
+as an ordinary git-over-SSH workflow. Reality, observed during
+`examples/custom-image-smoke` validation in May 2026:
+
+- Direct connections from international IPs (Philippines source, in
+  this case) to `gitlab-clients.sitehost.co.nz:22` get TCP "connection
+  refused" — the port is not reachable at all from outside the
+  SiteHost / NZ network.
+- From a SiteHost cloud container in NZ (verified against both
+  `45.113.8.110` and `223.165.71.164`), `nc -zv` to port 22 succeeds
+  on the *first* probe but subsequent SSH attempts return "connection
+  refused" at the TCP layer for several minutes. Behaviour is
+  consistent with per-source-IP rate limiting / fail2ban-style
+  banning at GitLab's edge.
+- Port 443 (HTTPS) stays reachable from international IPs throughout.
+- The git-over-SSH retry loop (e.g. `examples/custom-image-smoke`
+  trying 6× with 10s spacing) appears to *cause* the ban rather than
+  recover from it; first-attempt failures should not be retried
+  aggressively.
+
+The KB article that's closest to this concern
+(`/cloud-containers/custom-images/access-via-ssh`) only documents
+SSH-key-as-account-credential semantics. There is no mention of:
+
+- source-IP allow-listing requirements,
+- rate-limiting / fail2ban behaviour,
+- HTTPS-clone-with-PAT as a possible alternative,
+- or that running from outside NZ may need operator support.
+
+**Open question:** what is the supported way to reach
+`gitlab-clients.sitehost.co.nz:22` from an external developer
+machine or CI runner that doesn't live in the SiteHost network?
+Is HTTPS clone with a personal access token supported on port 443?
+
+**Operational impact for AI agents:** this is the #1 blocker for
+SDK consumers driving `cloud.image` workflows from outside the NZ
+network. Until clarified, examples should:
+
+1. Document the constraint prominently (see
+   `examples/custom-image-smoke` package comment).
+2. Default the retry loop to single-attempt with long backoff
+   rather than aggressive retries that worsen the problem.
+3. Surface a `JOURNEY_GIT_PROXY_JUMP` env var so consumers with
+   bastion access can route through it without SDK changes.
+4. Flag failed-delete jobs as a downstream symptom: if the GitLab
+   project never accepted a first push, `cloud.image.Delete`
+   sometimes returns `"We could not delete your custom image right
+   now"` and orphans the metadata record. `examples/probe-images`
+   with `CLEANUP_IMAGE_PREFIX=` provides the manual recovery path.
+
+**Resolution paths:**
+
+- SiteHost ops whitelists the consumer's IP / IP range against the
+  GitLab edge firewall (best for individual consumers).
+- KB / API docs add a "Network access" section to the custom-image
+  pages capturing whichever option above is supported.
+- If HTTPS clone is supported, document the auth flow (PAT
+  generation, header format) so SDKs can offer an HTTPS path that
+  doesn't depend on SSH allow-listing.
+
+---
+
 ## Process
 
 When something else surfaces while writing an example or wrapper,

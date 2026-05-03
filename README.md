@@ -69,70 +69,75 @@ This section is **transient** — it lists feat branches awaiting
 upstream review and the recommended merge order. Drop the section
 once everything below is merged.
 
-All branches are independent (single-squashed-commit off `main`,
-disjoint files) and can technically land in any order. The order
-below is reviewer-friendly: smallest / lowest-risk first.
+Each branch is a single-squashed-commit off `main`. Where multiple
+branches edited the same package, they've been **consolidated into
+per-namespace branches** (e.g. all the cloud/* work lives on
+`feat/cloud`; all the server/* work on `feat/server`) so reviewers
+see one PR per package surface instead of fragmented per-feature
+PRs.
+
+The order below is reviewer-friendly: smallest / lowest-risk first.
 
 ### Batch 1 — trivial cleanups (review in minutes)
 
-| Branch | Surface |
-|---|---|
-| `feat/comment-fixups` | 5 doc-comment endpoint-path typos (image package + models) |
-| `feat/cloud-ssh-user-volumes-tag` | One-line `url` tag fix on `cloud/ssh/user.AddRequest.Volumes` |
-| `feat/job-message-field` | Adds `Message` field to `models.JobDetails` |
+| Branch | LoC | Surface |
+|---|---|---|
+| `feat/comment-fixups` | 5 | Doc-comment endpoint-path typos (image package + models) |
+| `feat/job-message-field` | 10 | Adds `Message` field to `models.JobDetails` |
 
-### Batch 2 — small additive PRs
+### Batch 2 — small additive PRs (review in 5–15 min)
 
-| Branch | Surface |
-|---|---|
-| `feat/dns-domain-templates` | 1 endpoint, new `pkg/api/dns/template` sub-package |
-| `feat/info-discover-client-id` | New helper `info.NewClientWithDiscovery` (+ 4 tests) — bootstrap `*api.Client` from just an API key |
+| Branch | LoC | Surface |
+|---|---|---|
+| `feat/info-discover-client-id` | 154 | New helper `info.NewClientWithDiscovery` — bootstrap `*api.Client` from just an API key |
+| `feat/accounts` | 248 | New top-level namespace; 1 endpoint (`accounts/client/list_sub_accounts`) — sub-account discovery for resellers |
+| `feat/redirect` | 277 | New top-level namespace; 1 endpoint (`redirect/list_redirects`) with custom UnmarshalJSON to tolerate the API's empty-result shape (`[]` not `{}`) |
+| `feat/misc-fillins` | 290 | Small filler set across existing packages |
 
-### Batch 3 — existing-package extensions
+### Batch 3 — single-package additions
 
-| Branch | Surface |
-|---|---|
-| `feat/dns-reads` | 1 new endpoint + `GetZoneResponse` schema fix + 11 backfilled tests |
-| `feat/bandwidth-usage` | 5 new endpoints + 1 backfilled test |
+| Branch | LoC | Surface |
+|---|---|---|
+| `feat/ssl` | 413 | 3 read endpoints, new `pkg/api/ssl` package (writes deferred) |
+| `feat/bandwidth-usage` | 526 | 5 read endpoints (per-day/month/year/summary + IP list), backfilled tests |
 
-### Batch 4 — new small packages
+### Batch 4 — consolidated per-namespace surfaces
 
-| Branch | Surface |
-|---|---|
-| `feat/ssl` | 3 endpoints, new `pkg/api/ssl` package |
-| `feat/server` | reads + writes on existing `pkg/api/server` |
+These branches each fold the full per-namespace work — typically
+several earlier feat branches' worth — into one squash commit.
+Larger review surface, but each one lands a coherent package end
+to end.
 
-### Batch 5 — new larger packages
+| Branch | LoC | Surface |
+|---|---|---|
+| `feat/dns` | 2,104 | Reads + writes + records + zones + domain_templates sub-package (14 endpoints there alone) + reverse-DNS + SOA. Folds 4 prior feat branches. |
+| `feat/server` | 2,307 | Full server lifecycle (Create / Get / List / Update / Delete with `force_delete=1` support / Upgrade / UpgradeComponents / state ops) + snapshots sub-package + firewall sub-package + IP allocation paths documented (`auto` / specific / staff-allocated). Folds 4 prior feat branches. |
+| `feat/mail` | 2,528 | Full mail surface — domains / aliases / accounts / forwards / list_all union view + per-domain catch-all caveats. Folds 2 prior feat branches. |
+| `feat/cloud` | 3,520 | Full cloud namespace — stack writes, db + grants, ssh.user, server config, image management with helpers (`ForkFromImage`, `WaitForBuild`, `LintManifest`, `DeleteAndWait`), volume CRUD, ssl/letsencrypt sub-package. Folds 6 prior feat branches. |
 
-| Branch | Surface |
-|---|---|
-| `feat/cloud-volume` | 6 endpoints, new sub-package |
-| `feat/server-snapshot` | 5 endpoints incl. destructive `Restore` |
-| `feat/cloud-stack-writes` | 6 write ops on `pkg/api/cloud/stack` (Update, Delete, Copy, Overwrite, Backup, PurgeCache). Param shapes inferred from API validation messages — sanity-check before merge. |
+### Batch 5 — registry (heaviest review surface)
 
-### Batch 6 — heaviest review surface
+| Branch | LoC | Surface |
+|---|---|---|
+| `feat/srs` | 1,376 | Registry reads + .nz domain lifecycle — 16 endpoints. Writes (~20 more) still in flight. |
 
-| Branch | Surface |
-|---|---|
-| `feat/mail` | ~17 endpoints (full mail, reads + writes) |
-| `feat/srs` | full registry package, ~16 endpoints, .nz lifecycle |
+### Aggregated working tree (`feat/examples`)
 
-### Aggregated working tree
+`feat/examples` is the **integration branch** — it carries every
+feat branch above plus the SHC-internal `examples/` tree
+(`build-a-site`, `full-overview`, `cloud-volume`, `custom-image*`,
+`cloud-db-compare`, `dns*`, `mail*`, `server-reads`,
+`server-upgrade-components`, `vps-*`, `srs`, `accounts`,
+`redirect`, etc.) and the live-validation findings captured in
+`docs/api-issues/`.
 
-Every batch above is also cherry-picked onto `integration` for
-combined-state testing. SHC's `go.mod` `replace` directive should
-pin to a tag on `integration`, never to a branch HEAD. As feat
-branches land upstream, drop them from `integration` on the next
-rebuild.
+This is the branch consumers of gosh-from-our-fork should pin
+their `go.mod` `replace` directive against. As per-namespace
+branches above land upstream, the equivalent commits will drop off
+`feat/examples` on the next rebuild.
 
-### Examples branch (`feat/examples`)
-
-Not for upstream as-is. Contains the SHC-internal `examples/` tree
-(`build-a-site`, `full-overview`, `cloud-volume`, `dns`, `mail`,
-`server-reads`, `server-snapshot`, `srs`). Its commits depend on
-the SDK feat branches above being upstream first. Once batches 1–6
-merge, rebase the example commits on upstream `main` and open a
-single `feat/examples-tree` PR.
+Build status: clean. Tests: passing. Validated live across all
+re-run examples this session.
 
 ---
 

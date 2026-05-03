@@ -1,6 +1,22 @@
-// Program custom-image-smoke is a minimal round-trip check of the
-// custom-image build cycle. It does NOT deploy a stack or probe a
-// running container — purely:
+// Program custom-image-smoke validates the custom-image build cycle
+// end-to-end at the build-trace level. It does NOT deploy a stack or
+// probe a running container — that's the next-iteration's job once
+// build-time validation is solid.
+//
+// Two modes (set via JOURNEY_MODE):
+//
+//	echo (default) — append `RUN echo <marker>` to the Dockerfile,
+//	                 assert the marker appears in the CI build trace.
+//	                 Cheapest possible round trip.
+//	pecl           — append a `RUN pecl install mailparse yaml &&
+//	                 phpenmod ...` block, assert that BOTH PECL
+//	                 install lines and the phpenmod confirmation
+//	                 appear in the build trace. Validates that PHP
+//	                 extension installation actually works on the
+//	                 sitehost-php85-apache base, before we wire up
+//	                 a runtime probe.
+//
+// In all modes:
 //
 //  1. Generate an ed25519 SSH keypair, register the public half via
 //     ssh.key.Create.
@@ -125,11 +141,20 @@ func run() error {
 	}
 	log.Printf("client_id=%s", c.ClientID)
 
+	mode := os.Getenv("JOURNEY_MODE")
+	if mode == "" {
+		mode = "echo"
+	}
+	if mode != "echo" && mode != "pecl" {
+		return fmt.Errorf("JOURNEY_MODE must be 'echo' or 'pecl', got %q", mode)
+	}
+
 	suffix := randomSuffix()
 	keyName := "gosh-smoke-" + suffix
 	imageCode := "gosh-smoke-" + suffix
 	imageLabel := "gosh smoke " + suffix
 	marker := fmt.Sprintf("Hello world from gosh smoke %s", suffix)
+	log.Printf("mode=%s suffix=%s", mode, suffix)
 
 	var (
 		keyID         int
@@ -145,18 +170,15 @@ func run() error {
 		}
 		log.Printf("==> cleanup")
 		if createdImage {
-			// cloud.image.Delete returns a scheduler job; the record
-			// remains visible until that job completes. Without the
-			// wait, repeated runs accumulate orphan images.
-			resp, err := cloudImage.New(c).Delete(ctx, cloudImage.DeleteRequest{Code: imageCode})
-			if err != nil {
-				log.Printf("    cloud.image.Delete: %v", err)
-			} else if resp.Return.ID > 0 {
-				if werr := waitForJob(ctx, c, resp.Return.ID, resp.Return.Type, jobTimeout); werr != nil {
-					log.Printf("    wait for image delete: %v", werr)
-				} else {
-					log.Printf("    deleted image %s", imageCode)
-				}
+			// DeleteAndWait absorbs the "could not delete your custom
+			// image right now" transient that the platform returns
+			// when the image has just been built/pushed to. Without
+			// the retry loop, fresh-image cleanup fails on first
+			// attempt and accumulates orphans.
+			if err := cloudImage.New(c).DeleteAndWait(ctx, imageCode, 5, jobTimeout, 10*time.Second); err != nil {
+				log.Printf("    cloud.image.DeleteAndWait: %v", err)
+			} else {
+				log.Printf("    deleted image %s", imageCode)
 			}
 		}
 		if createdKey {
@@ -250,19 +272,25 @@ func run() error {
 	}
 	gitEnv := append(os.Environ(), "GIT_SSH_COMMAND="+sshCmd)
 
+	// Single attempt only. gitlab-clients.sitehost.co.nz appears to
+	// run aggressive per-IP rate limiting / fail2ban: repeated
+	// connect attempts (even legitimate retries) trigger TCP-level
+	// "connection refused" for several minutes against the source
+	// IP, deepening the failure rather than recovering from it. If
+	// one clean attempt fails, give up immediately and let the
+	// caller diagnose — don't probe further.
+	//
+	// We do still wait briefly before this single attempt: the
+	// create-image scheduler job marks complete a beat before the
+	// GitLab repository is actually push-receivable.
+	time.Sleep(5 * time.Second)
+	cmd := exec.CommandContext(ctx, "git", "clone", cloneURL, ".")
+	cmd.Dir = repoDir
+	cmd.Env = gitEnv
+	out, err := cmd.CombinedOutput()
 	var cloneErr error
-	for i := 0; i < 6; i++ {
-		cmd := exec.CommandContext(ctx, "git", "clone", cloneURL, ".")
-		cmd.Dir = repoDir
-		cmd.Env = gitEnv
-		out, err := cmd.CombinedOutput()
-		if err == nil {
-			cloneErr = nil
-			break
-		}
+	if err != nil {
 		cloneErr = fmt.Errorf("%w\n%s", err, string(out))
-		log.Printf("    clone attempt %d failed; retrying in 10s", i+1)
-		time.Sleep(10 * time.Second)
 	}
 	if cloneErr != nil {
 		return fmt.Errorf("git clone: %w", cloneErr)
@@ -274,11 +302,35 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("read Dockerfile: %w", err)
 	}
-	patch := fmt.Sprintf("\n# gosh-smoke marker\nRUN echo %q\n", marker)
+	var patch string
+	switch mode {
+	case "echo":
+		patch = fmt.Sprintf("\n# gosh-smoke marker\nRUN echo %q\n", marker)
+	case "pecl":
+		// Install mailparse + yaml via PECL on sitehost-php85-apache.
+		// libyaml-dev is the build dep for the yaml extension; php-pear
+		// + php-dev provide pecl + phpize. phpenmod symlinks the
+		// generated .ini files into conf.d so the extensions load on
+		// the next php startup.
+		//
+		// We also echo a unique marker so the trace assertion can
+		// cleanly distinguish a successful PECL run from any earlier
+		// build's logs.
+		patch = fmt.Sprintf(`
+# gosh-smoke pecl marker
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libyaml-dev php-pear php-dev \
+    && pecl install mailparse yaml \
+    && phpenmod -v ALL mailparse yaml \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo %q
+`, marker)
+	}
 	if err := os.WriteFile(dockerfilePath, append(current, []byte(patch)...), 0o644); err != nil {
 		return fmt.Errorf("write Dockerfile: %w", err)
 	}
-	log.Printf("    appended marker: %s", marker)
+	log.Printf("    appended %s patch (marker=%q)", mode, marker)
 
 	// 5. Commit + push
 	log.Printf("==> commit + push")
@@ -325,7 +377,26 @@ func run() error {
 	if !strings.Contains(trace.Return.BuildTrace, marker) {
 		return fmt.Errorf("marker %q NOT found in build trace", marker)
 	}
-	log.Printf("✓ marker %q found in build trace — full round trip verified", marker)
+	log.Printf("✓ marker %q found in build trace", marker)
+
+	if mode == "pecl" {
+		// PECL emits "Build process completed successfully\n
+		// Installing '<so-path>'\nNo changes\nExtension <name> enabled
+		// in php.ini" (Debian phpenmod path). Match the most stable
+		// sub-strings: the "install ok" lines from PECL itself.
+		// Both extensions must show — partial install is a fail.
+		expect := []string{
+			"install ok: channel://pecl.php.net/mailparse",
+			"install ok: channel://pecl.php.net/yaml",
+		}
+		for _, want := range expect {
+			if !strings.Contains(trace.Return.BuildTrace, want) {
+				return fmt.Errorf("PECL trace missing %q — install did not complete", want)
+			}
+			log.Printf("✓ trace contains %q", want)
+		}
+	}
+	log.Printf("✓ full round trip verified (mode=%s)", mode)
 	return nil
 }
 
@@ -361,35 +432,13 @@ func waitForJob(ctx context.Context, c *api.Client, id int, jobType string, time
 }
 
 // openSSHPrivateKey encodes an ed25519 private key in OpenSSH PEM
-// format.
+// format using the upstream ssh.MarshalPrivateKey helper. (Earlier
+// hand-rolled binary serialisation produced files that
+// /usr/bin/ssh rejected as "invalid format".)
 func openSSHPrivateKey(priv ed25519.PrivateKey) ([]byte, error) {
-	const magic = "openssh-key-v1\x00"
-	pub := priv.Public().(ed25519.PublicKey)
-	pubW := gossh.Marshal(struct {
-		KeyType string
-		Pub     []byte
-	}{"ssh-ed25519", pub})
-	checkint := uint32(time.Now().UnixNano())
-	privW := gossh.Marshal(struct {
-		Check1, Check2 uint32
-		Keytype        string
-		Pub            []byte
-		Priv           []byte
-		Comment        string
-	}{checkint, checkint, "ssh-ed25519", pub, []byte(priv), "gosh-smoke"})
-	for len(privW)%8 != 0 {
-		privW = append(privW, byte(len(privW)%8+1))
+	block, err := gossh.MarshalPrivateKey(priv, "gosh-smoke")
+	if err != nil {
+		return nil, err
 	}
-	header := struct {
-		CipherName, KdfName string
-		KdfOpts             string
-		NumKeys             uint32
-		PubKey              []byte
-		PrivBlob            []byte
-	}{"none", "none", "", 1, pubW, privW}
-	body := append([]byte(magic), gossh.Marshal(header)...)
-	return pem.EncodeToMemory(&pem.Block{
-		Type:  "OPENSSH PRIVATE KEY",
-		Bytes: body,
-	}), nil
+	return pem.EncodeToMemory(block), nil
 }

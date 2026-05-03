@@ -183,6 +183,54 @@ network. Until clarified, examples should:
 
 ---
 
+## `cloud.image.Delete` rejects fresh / just-built images
+
+`cloud/image/delete.json` returns success at the API layer
+(`status:true`) but its scheduler job can come back as `Failed` with
+the verbatim message:
+
+```
+We could not delete your custom image right now. Please contact
+support@sitehost.co.nz
+```
+
+Empirically this is *transient*: the same delete call succeeds a
+few seconds later. It appears to fire when a delete is issued too
+soon after a build/push completes — e.g. immediately after a
+fresh `cloud.image.Create` or right after a CI job ends. Likely a
+GC / lock window on the platform side; the customer-facing error
+points at support but no contact is actually needed.
+
+**Operational impact:** Without retry, every fresh-image cleanup
+fails on the first attempt and orphans the metadata record. AI
+agents driving the SDK accumulate these orphans run-over-run with
+no indication that the cleanup didn't actually take.
+
+**Discoverability gap:** the error message is misleading — it
+implies a permanent / support-needed condition, when in practice
+a 10-second backoff and retry succeeds. The KB does not document
+this behaviour; the API docs don't either.
+
+**Mitigation in gosh:** `cloud.image.DeleteAndWait` (helper) wraps
+`Delete` + scheduler-job polling, recognises the transient by
+substring match on the job's Message field, and retries with
+backoff up to N attempts. Examples should always cleanup via the
+helper rather than bare `Delete`.
+
+**Open questions:**
+
+- Is the rejection actually transient in all cases, or are there
+  states (e.g. image-in-use-by-running-container) where the same
+  message indicates a true terminal failure? The current heuristic
+  treats every match as transient — could mask a real problem.
+- Should the API surface a distinct error code for the transient
+  vs the terminal cases, so consumers don't have to substring-match
+  on user-facing strings?
+- Should the message itself be updated to remove the misleading
+  "contact support" guidance for the transient case?
+
+---
+
 ## Process
 
 When something else surfaces while writing an example or wrapper,

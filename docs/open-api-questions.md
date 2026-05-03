@@ -231,6 +231,83 @@ helper rather than bare `Delete`.
 
 ---
 
+## PECL extension installs don't auto-enable on `sitehost-php*-apache`
+
+When forking `sitehost-php85-apache` (and likely the other apache
+PHP base images) and adding a PECL extension via the standard
+incantation:
+
+```dockerfile
+RUN apt-get install -y libyaml-dev php-pear php-dev \
+    && pecl install mailparse yaml \
+    && phpenmod -v ALL mailparse yaml
+```
+
+…the `pecl install` step succeeds (`install ok: channel://
+pecl.php.net/{mailparse,yaml}` appears in the build trace) and the
+`.so` files land in `/usr/local/lib/php/extensions/`, but PECL
+emits a warning the trace makes plain:
+
+```
+configuration option "php_ini" is not set to php.ini location
+You should add "extension=mailparse.so" to php.ini
+```
+
+`phpenmod`'s own output is silent (no `Extension … enabled` line
+appears) — suggesting it didn't find anything to enable, because
+PECL installed under `/usr/local/...` rather than the system path
+`phpenmod` scans (`/etc/php/<v>/mods-available/`). The end result
+is that extension `.so` files are **present but not loaded at
+runtime**.
+
+**Operational impact:** A purely build-time check (e.g. trace
+assertion that PECL install lines appear) would show a green
+build, but `extension_loaded('mailparse')` at runtime would
+return false. The customer / AI agent only finds out when their
+application throws at runtime.
+
+**Discoverability gap:** The KB's custom-images section explains
+how to author a Dockerfile but doesn't document:
+
+- Where the parent image's PHP install actually lives
+  (`/usr/local` vs system `/etc/php/<v>/`).
+- The right way to drop in an extension `.ini` so it's picked up
+  by Apache + mod_php on first start.
+- That `phpenmod -v ALL` is a no-op for PECL-installed extensions
+  on these base images.
+
+**Workaround (not yet validated by gosh, listed as candidates):**
+
+- Write the `extension=<name>.so` line directly into the path PHP
+  reads — likely `/usr/local/etc/php/conf.d/<name>.ini` (or wherever
+  this base image expects per-extension config). A short `RUN echo
+  "extension=mailparse.so" > <path>/mailparse.ini` after the PECL
+  step, but the *correct* path depends on the parent image's
+  layout.
+- `pecl install -d php_ini=<path>` to point PECL at the right
+  php.ini at install time so it auto-appends.
+- A SiteHost-published Dockerfile snippet for adding extensions to
+  each `sitehost-php*-apache` base, mirroring the pattern in the
+  rest of the cloud-containers docs.
+
+**Open questions:**
+
+- Where exactly does PHP look for extension `.ini` files inside
+  `sitehost-php85-apache:1.0.1-noble`? Confirming once would let
+  the SDK / docs prescribe the canonical install pattern.
+- Is there a SiteHost-supplied helper script inside the base image
+  for installing PECL extensions correctly (analogous to the
+  official PHP image's `docker-php-ext-enable`)?
+
+**Validation status:** unverified at runtime. To confirm/refute,
+deploy a stack from the smoke-built image and check `phpinfo()`
+or `php -m` against the running container — the smoke's pecl mode
+asserts only build-time install, not runtime loading. This is
+exactly the gap that `examples/custom-image` (Phase 2: stack
+deploy + phpinfo probe) is intended to close.
+
+---
+
 ## Process
 
 When something else surfaces while writing an example or wrapper,

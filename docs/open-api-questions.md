@@ -265,17 +265,8 @@ substring match on the job's Message field, and retries with
 backoff up to N attempts. Examples should always cleanup via the
 helper rather than bare `Delete`.
 
-**Open questions:**
-
-- Is the rejection actually transient in all cases, or are there
-  states (e.g. image-in-use-by-running-container) where the same
-  message indicates a true terminal failure? The current heuristic
-  treats every match as transient — could mask a real problem.
-- Should the API surface a distinct error code for the transient
-  vs the terminal cases, so consumers don't have to substring-match
-  on user-facing strings?
-- Should the message itself be updated to remove the misleading
-  "contact support" guidance for the transient case?
+Tracked as a sharper actionable bug report at
+[`docs/api-issues/cloud-image-delete-transient.md`](api-issues/cloud-image-delete-transient.md).
 
 ---
 

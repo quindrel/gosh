@@ -48,3 +48,12 @@ questions.
   `cloud.stack.Add` requires an explicit image version tag
   (no `:latest` shortcut) but the rejection message doesn't
   point at the version source.
+- [`dns-reset-reverse-dns-asymmetric-access.md`](./dns-reset-reverse-dns-asymmetric-access.md) —
+  `dns.ResetReverseDNS` rejects IPs that `dns.UpdateReverseDNS`
+  succeeds on for the same client + IP. Misleading "no access"
+  error.
+- [`server-provision-ipv4-shape-asymmetric.md`](./server-provision-ipv4-shape-asymmetric.md) —
+  `server.Create`'s `params[ipv4]` requires array form
+  (`params[ipv4][0]=auto`) for modern KVM products but scalar form
+  (`params[ipv4]=auto`) for legacy Xen products. SDKs that
+  serialise one shape silently break against the other family.

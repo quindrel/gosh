@@ -33,17 +33,48 @@
 //
 // Optional env:
 //
-//	SH_CLIENT_ID              — sub-account targeting; otherwise discovered
-//	SH_CCS_NAME               — name of an existing CCS to deploy on. If
-//	                            unset, the example picks the first CCS
-//	                            from cloud.server.List (read-only — never
-//	                            provisions a CCS itself, since this example
-//	                            is already long-running).
-//	JOURNEY_KEEP=1            — leave the image, stack, and SSH keys in
-//	                            place after the run for inspection.
-//	                            Default: cleanup.
-//	JOURNEY_PARENT_IMAGE      — override the parent image code
+//	SH_CLIENT_ID              — sub-account targeting; otherwise discovered.
+//	SH_CCS_NAME               — name of an existing CCS to deploy on.
+//	                            Mutually exclusive with JOURNEY_PROVISION_CCS.
+//	                            If neither set, picks the first CCS from
+//	                            cloud.server.List.
+//	JOURNEY_PROVISION_CCS=1   — provision a fresh CCS in AKLCITY (zero-cost
+//	                            staff region) just for this run, instead of
+//	                            using SH_CCS_NAME or auto-pick. Adds ~5min
+//	                            to the run; tear-down happens at cleanup
+//	                            unless JOURNEY_KEEP_CCS=1.
+//	JOURNEY_CCS_IMAGE         — override the CCS provisioning image code
+//	                            (default: ubuntu-cc-2404-20260323).
+//	JOURNEY_PARENT_IMAGE      — override the custom-image fork parent
 //	                            (default: sitehost-php85-apache).
+//	JOURNEY_KEEP=1            — leave EVERYTHING (image, stack, SSH keys,
+//	                            CCS) in place after the run for inspection.
+//	JOURNEY_KEEP_CCS=1        — leave the provisioned CCS but tear down
+//	                            stack/image/keys. Used to amortise CCS
+//	                            provisioning across iterative runs.
+//	JOURNEY_KEEP_IMAGE=1      — leave the built custom image but tear down
+//	                            stack/keys. Used together with
+//	                            JOURNEY_REUSE_IMAGE on subsequent runs.
+//	JOURNEY_REUSE_IMAGE=<code> — skip fork+clone+build entirely; resolve
+//	                            an existing image's id and deploy a stack
+//	                            from its latest successful build. Pair with
+//	                            SH_CCS_NAME to repeat the runtime probe in
+//	                            seconds rather than minutes during iteration.
+//
+// Iteration workflow (after one initial slow run):
+//
+//	# 1. First run — provision + build + keep both for reuse:
+//	JOURNEY_PROVISION_CCS=1 JOURNEY_KEEP_CCS=1 JOURNEY_KEEP_IMAGE=1 ./custom-image
+//	# Note the printed CCS name and image code at the end.
+//
+//	# 2. Iterate — reuse both, just deploy/probe/clean:
+//	SH_CCS_NAME=<name> JOURNEY_REUSE_IMAGE=<code> JOURNEY_KEEP_CCS=1 \
+//	    JOURNEY_KEEP_IMAGE=1 ./custom-image
+//	# Each iteration is ~30-60 seconds.
+//
+//	# 3. When done, tear down explicitly:
+//	# (delete the CCS via gosh or Control Panel; image is auto-cleaned
+//	# when the CCS goes since image records aren't shared across CCSes.)
 //
 // Side effects:
 //   - Creates one customer SSH key (ssh.key) and one container SSH user
@@ -82,7 +113,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/pkg/sftp"
@@ -91,28 +121,46 @@ import (
 	cloudImage "github.com/sitehostnz/gosh/pkg/api/cloud/image"
 	imgVersion "github.com/sitehostnz/gosh/pkg/api/cloud/image/version"
 	cloudServer "github.com/sitehostnz/gosh/pkg/api/cloud/server"
+	cloudSSHUser "github.com/sitehostnz/gosh/pkg/api/cloud/ssh/user"
 	"github.com/sitehostnz/gosh/pkg/api/cloud/stack"
 	"github.com/sitehostnz/gosh/pkg/api/info"
 	"github.com/sitehostnz/gosh/pkg/api/job"
+	"github.com/sitehostnz/gosh/pkg/api/server"
 	sshKey "github.com/sitehostnz/gosh/pkg/api/ssh/key"
+	pnet "github.com/sitehostnz/gosh/pkg/net"
 )
 
 const (
 	defaultParentImage = "sitehost-php85-apache"
 	imageBuildTimeout  = 15 * time.Minute
 	imageBuildPoll     = 15 * time.Second
+
+	// CCS provisioning constants — used only when
+	// JOURNEY_PROVISION_CCS=1 (default OFF; existing CCSes are
+	// reused via SH_CCS_NAME or auto-picked otherwise).
+	ccsLocation         = "AKLCITY"      // zero-cost staff region (matches probe-tls-default)
+	ccsProductCode      = "CLDCON4-P"    // Performance Cloud Container - 4 Core
+	ccsDefaultImageCode = "ubuntu-cc-2404-20260323"
+	ccsProvisionTimeout = 15 * time.Minute
 	jobPollInterval    = 5 * time.Second
 	jobTimeout         = 10 * time.Minute
 )
 
 func main() {
+	if err := mainErr(); err != nil {
+		log.Fatalf("custom-image: %v", err)
+	}
+}
+
+// mainErr owns the lifecycle so deferred cleanup runs even when a
+// step fails (log.Fatalf calls os.Exit and skips defers — leaks).
+func mainErr() error {
 	ctx := context.Background()
 	r := &runner{ctx: ctx}
 
 	if err := r.setup(); err != nil {
-		log.Fatalf("setup: %v", err)
+		return fmt.Errorf("setup: %w", err)
 	}
-
 	defer r.cleanup()
 
 	steps := []struct {
@@ -120,7 +168,7 @@ func main() {
 		fn   func() error
 	}{
 		{"register SSH key", r.registerSSHKey},
-		{"locate target CCS", r.locateCCS},
+		{"provision CCS (or use existing)", r.locateOrProvisionCCS},
 		{"fork custom image", r.forkImage},
 		{"clone repo + edit Dockerfile", r.cloneAndEdit},
 		{"git push (triggers build)", r.commitAndPush},
@@ -131,7 +179,7 @@ func main() {
 	for _, s := range steps {
 		log.Printf("==> %s", s.name)
 		if err := s.fn(); err != nil {
-			log.Fatalf("%s: %v", s.name, err)
+			return fmt.Errorf("%s: %w", s.name, err)
 		}
 	}
 
@@ -139,6 +187,7 @@ func main() {
 	log.Printf("  image code:   %s", r.imageCode)
 	log.Printf("  stack:        %s on %s", r.stackName, r.serverName)
 	log.Printf("  smoke URL:    %s", r.siteURL)
+	return nil
 }
 
 type runner struct {
@@ -164,17 +213,22 @@ type runner struct {
 	repoDir string
 
 	// Stack state
-	stackName string
-	siteURL   string
-	siteHost  string
-	siteIP    string
+	stackName         string
+	siteURL           string
+	siteHost          string
+	siteIP            string
+	containerUsername string
+	imageVersion      string // e.g. "1.0-26356", from WaitForBuild
 
 	// Cleanup flags
 	keep                bool
+	keepCCS             bool
+	keepImage           bool
 	createdSSHKey       bool
 	createdContainerKey bool
 	createdImage        bool
 	createdStack        bool
+	provisionedCCS      bool
 }
 
 func (r *runner) setup() error {
@@ -185,6 +239,8 @@ func (r *runner) setup() error {
 	clientID := os.Getenv("SH_CLIENT_ID")
 
 	r.keep = os.Getenv("JOURNEY_KEEP") == "1"
+	r.keepCCS = r.keep || os.Getenv("JOURNEY_KEEP_CCS") == "1"
+	r.keepImage = r.keep || os.Getenv("JOURNEY_KEEP_IMAGE") == "1"
 	r.parentImage = os.Getenv("JOURNEY_PARENT_IMAGE")
 	if r.parentImage == "" {
 		r.parentImage = defaultParentImage
@@ -210,6 +266,15 @@ func (r *runner) setup() error {
 	r.imageLabel = "gosh custom-image " + suffix
 	r.imageCode = "gosh-customimg-" + suffix
 	r.stackName = "ciexample" + suffix
+
+	// Reuse mode: skip the fork+clone+build cycle entirely and just
+	// deploy / probe / clean a stack against an already-built image.
+	// Used together with SH_CCS_NAME to repeat the runtime probe
+	// quickly while iterating on phpinfo or extension behaviour.
+	if reuse := os.Getenv("JOURNEY_REUSE_IMAGE"); reuse != "" {
+		r.imageCode = reuse
+		log.Printf("JOURNEY_REUSE_IMAGE=%s — skipping fork+build steps", reuse)
+	}
 	return nil
 }
 
@@ -256,26 +321,101 @@ func (r *runner) registerSSHKey() error {
 	return nil
 }
 
-// locateCCS picks the target CCS: env override or the first CCS
-// returned by cloud.server.List. Read-only — this example assumes a
-// CCS already exists. Provisioning a fresh one would more than
-// double the example's runtime.
-func (r *runner) locateCCS() error {
+// locateOrProvisionCCS picks the target CCS in priority order:
+//
+//  1. SH_CCS_NAME env var — explicit override.
+//  2. JOURNEY_PROVISION_CCS=1 — provision a fresh CCS in AKL01,
+//     used just for this run, deleted at cleanup. Avoids hitting
+//     image-count limits on shared test CCSes.
+//  3. Auto-pick the first CCS from cloud.server.List (cheap path
+//     when an empty / lightly-loaded CCS already exists).
+func (r *runner) locateOrProvisionCCS() error {
 	if name := os.Getenv("SH_CCS_NAME"); name != "" {
 		r.serverName = name
 		log.Printf("    using CCS %q from SH_CCS_NAME", name)
 		return nil
+	}
+	if os.Getenv("JOURNEY_PROVISION_CCS") == "1" {
+		return r.provisionFreshCCS()
 	}
 	servers, err := cloudServer.New(r.c).List(r.ctx)
 	if err != nil {
 		return fmt.Errorf("cloud.server.List: %w", err)
 	}
 	if len(servers.CloudServers) == 0 {
-		return fmt.Errorf("no Cloud Container Servers found; set SH_CCS_NAME to target one explicitly")
+		return fmt.Errorf("no Cloud Container Servers found; set SH_CCS_NAME or JOURNEY_PROVISION_CCS=1")
 	}
 	r.serverName = servers.CloudServers[0].Name
 	log.Printf("    auto-selected CCS %q", r.serverName)
 	return nil
+}
+
+// provisionFreshCCS provisions a temporary CCS in AKL01 (zero-cost
+// staff region), waits for the scheduler job, and records cleanup
+// state. The CCS is torn down by cleanup() with force_delete=1
+// (needed because the platform auto-deploys an infra stack on
+// every fresh CCS that plain Delete refuses to remove).
+func (r *runner) provisionFreshCCS() error {
+	imageCode := os.Getenv("JOURNEY_CCS_IMAGE")
+	if imageCode == "" {
+		imageCode = ccsDefaultImageCode
+	}
+
+	ipAddr, err := rawFirstFreeIP(r.c, ccsLocation)
+	if err != nil {
+		return fmt.Errorf("list IPs in %s: %w", ccsLocation, err)
+	}
+	log.Printf("    free IP in %s: %s", ccsLocation, ipAddr)
+
+	srvClient := server.New(r.c)
+	createResp, err := srvClient.Create(r.ctx, server.CreateRequest{
+		Label:       "gosh-customimg-" + randHex(8),
+		Location:    ccsLocation,
+		ProductCode: ccsProductCode,
+		Image:       imageCode,
+		Params:      server.ParamsOptions{IPv4: []string{ipAddr}},
+	})
+	if err != nil {
+		return fmt.Errorf("server.Create: %w", err)
+	}
+	r.serverName = createResp.Return.Name
+	r.provisionedCCS = true
+	log.Printf("    provisioning CCS %q (job %d, type=%s)",
+		r.serverName, createResp.Return.ID, createResp.Return.Type)
+
+	if err := waitForJob(r.ctx, r.c, createResp.Return.ID, createResp.Return.Type, ccsProvisionTimeout); err != nil {
+		return fmt.Errorf("provision job: %w", err)
+	}
+	// Give nginx-proxy + infra stack time to come up before we add
+	// our stack on top.
+	log.Printf("    CCS provisioned; waiting 30s for infra stack to settle")
+	time.Sleep(30 * time.Second)
+	return nil
+}
+
+// rawFirstFreeIP — inline call to server/list_ips.json. Same
+// pattern as examples/probe-tls-default; swap to gosh's
+// server.ListIPs once the wrapper is on this branch.
+func rawFirstFreeIP(c *api.Client, loc string) (string, error) {
+	req, err := c.NewRequest("GET", "server/list_ips.json", "")
+	if err != nil {
+		return "", err
+	}
+	v := req.URL.Query()
+	v.Add("location", loc)
+	req.URL.RawQuery = pnet.Encode(v, []string{"apikey", "client_id", "location"})
+	var resp struct {
+		Return []struct {
+			IPAddr string `json:"ip_addr"`
+		} `json:"return"`
+	}
+	if err := c.Do(context.Background(), req, &resp); err != nil {
+		return "", err
+	}
+	if len(resp.Return) == 0 {
+		return "", fmt.Errorf("no free IPs at %s", loc)
+	}
+	return resp.Return[0].IPAddr, nil
 }
 
 // forkImage uses the cloud.image.ForkFromImage helper, which
@@ -283,8 +423,26 @@ func (r *runner) locateCCS() error {
 // cloud.image.Create. We then poll until the create-image job is
 // done, since the GitLab repository is provisioned asynchronously
 // and we can't clone before that completes.
+//
+// In JOURNEY_REUSE_IMAGE mode we just resolve the existing image's
+// numeric id (needed downstream by deployStack for the version tag)
+// and return — no fork, no Create job.
 func (r *runner) forkImage() error {
 	imgClient := cloudImage.New(r.c)
+	if os.Getenv("JOURNEY_REUSE_IMAGE") != "" {
+		got, err := imgClient.Get(r.ctx, cloudImage.GetRequest{Code: r.imageCode})
+		if err != nil {
+			return fmt.Errorf("cloud.image.Get(%s) for reuse: %w", r.imageCode, err)
+		}
+		id, err := strconv.Atoi(got.Image.ID)
+		if err != nil {
+			return fmt.Errorf("non-numeric image id %q: %w", got.Image.ID, err)
+		}
+		r.imageID = id
+		log.Printf("    reusing image id=%d code=%s", r.imageID, r.imageCode)
+		return nil
+	}
+
 	resp, err := imgClient.ForkFromImage(r.ctx,
 		r.parentImage, r.imageLabel, r.imageCode, []int{r.keyID})
 	if err != nil {
@@ -315,8 +473,13 @@ func (r *runner) forkImage() error {
 
 // cloneAndEdit clones the GitLab repo using the helper-constructed
 // URL, lints the existing manifest.yml, and appends a PECL install
-// directive to the Dockerfile.
+// directive to the Dockerfile. Skipped in JOURNEY_REUSE_IMAGE mode
+// since the image is already built.
 func (r *runner) cloneAndEdit() error {
+	if os.Getenv("JOURNEY_REUSE_IMAGE") != "" {
+		log.Printf("    JOURNEY_REUSE_IMAGE — skipping clone+edit")
+		return nil
+	}
 	cloneURL := cloudImage.New(r.c).CloneURL(r.imageCode)
 	log.Printf("    clone URL: %s", cloneURL)
 
@@ -326,19 +489,13 @@ func (r *runner) cloneAndEdit() error {
 	}
 	r.repoDir = dir
 
-	// GitLab repo provisioning is sometimes ready a beat after the job
-	// reports done. A small retry softens that race.
-	var cloneErr error
-	for i := 0; i < 6; i++ {
-		cloneErr = r.runGit(dir, "clone", cloneURL, ".")
-		if cloneErr == nil {
-			break
-		}
-		log.Printf("    clone attempt %d failed (%v); retrying", i+1, cloneErr)
-		time.Sleep(10 * time.Second)
-	}
-	if cloneErr != nil {
-		return fmt.Errorf("git clone: %w", cloneErr)
+	// Single attempt only. gitlab-clients.sitehost.co.nz runs aggressive
+	// per-IP rate limiting; retry loops trigger TCP-level "connection
+	// refused" against the source IP for several minutes. Wait briefly
+	// for the GitLab repo to settle, then take one shot.
+	time.Sleep(5 * time.Second)
+	if err := r.runGit(dir, "clone", cloneURL, "."); err != nil {
+		return fmt.Errorf("git clone: %w", err)
 	}
 
 	// Lint the manifest.yml that came in from the parent image.
@@ -363,18 +520,38 @@ func (r *runner) cloneAndEdit() error {
 		log.Printf("    Dockerfile already patched; skipping append")
 		return nil
 	}
+	// Install mailparse + yaml extensions via PECL (compiled against
+	// the running PHP at build time — works on any sitehost-php*
+	// base image regardless of the PHP version's apt-package
+	// availability).
+	//
+	// PECL on the SiteHost base writes the .so directly to
+	// /usr/local/lib/php/extensions/<name>.so (no api-version
+	// subdirectory). We then enable each extension by writing an
+	// .ini file with the absolute .so path into
+	// default-data/config/php/conf.d/ in the repo (handled in Go
+	// below) — that path becomes /container/config/php/conf.d/ at
+	// runtime via the standard SiteHost volume mount.
+	//
+	// Why hard-code the absolute path: the SiteHost PHP base
+	// image's extension_dir is /lib/php/extensions, but PECL
+	// installs to /usr/local/lib/php/extensions. Rather than
+	// copying .so files between paths (mismatched API versions can
+	// silently break runtime loading), the .ini just references
+	// the install location directly.
+	//
+	// Discovered via runtime phpinfo() probe — see
+	// docs/open-api-questions.md "PECL extension installs don't
+	// auto-enable on sitehost-php*-apache".
 	patch := `
 
 # gosh:custom-image marker — added by examples/custom-image
-# Installs the PECL mailparse + yaml extensions and enables them
-# for the system PHP. libyaml-dev is required at build time for
-# the yaml extension; we leave it in place since pecl re-runs may
-# need it.
+# Compile mailparse + yaml against the running PHP via PECL.
+# (libyaml-dev is the build-time dep for the yaml extension.)
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         libyaml-dev php-pear php-dev \
     && pecl install mailparse yaml \
-    && phpenmod -v ALL mailparse yaml \
     && rm -rf /var/lib/apt/lists/*
 `
 	combined := append(current, []byte(patch)...)
@@ -382,19 +559,45 @@ RUN apt-get update \
 		return fmt.Errorf("write Dockerfile: %w", err)
 	}
 	log.Printf("    Dockerfile patched (+%d bytes)", len(patch))
+
+	// Drop extension .ini files into default-data/config/php/conf.d/
+	// so they're mounted at /container/config/php/conf.d/ at runtime
+	// (per the runtime phpinfo probe finding above). Each .ini just
+	// declares "extension=<name>.so" — the .so itself is placed by
+	// the Dockerfile RUN above.
+	confDir := filepath.Join(dir, "default-data", "config", "php", "conf.d")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir conf.d: %w", err)
+	}
+	// Reference the .so by absolute path. PECL on this base image
+	// writes to /usr/local/lib/php/extensions/<name>.so directly
+	// (verified via build-trace inspection in custom-image-smoke
+	// pecl mode). PHP accepts an absolute path in `extension=`.
+	for _, ext := range []string{"mailparse", "yaml"} {
+		iniPath := filepath.Join(confDir, ext+".ini")
+		body := fmt.Sprintf("extension=/usr/local/lib/php/extensions/%s.so\n", ext)
+		if err := os.WriteFile(iniPath, []byte(body), 0o644); err != nil {
+			return fmt.Errorf("write %s.ini: %w", ext, err)
+		}
+		log.Printf("    wrote %s.ini", ext)
+	}
 	return nil
 }
 
 // commitAndPush stages, commits, and pushes the Dockerfile change.
 // The push triggers SiteHost's GitLab CI to build the image.
+// Skipped in JOURNEY_REUSE_IMAGE mode.
 func (r *runner) commitAndPush() error {
+	if os.Getenv("JOURNEY_REUSE_IMAGE") != "" {
+		return nil
+	}
 	if err := r.runGit(r.repoDir, "config", "user.email", "gosh-example@sitehost.nz"); err != nil {
 		return fmt.Errorf("git config email: %w", err)
 	}
 	if err := r.runGit(r.repoDir, "config", "user.name", "gosh custom-image example"); err != nil {
 		return fmt.Errorf("git config name: %w", err)
 	}
-	if err := r.runGit(r.repoDir, "add", "Dockerfile"); err != nil {
+	if err := r.runGit(r.repoDir, "add", "Dockerfile", "default-data"); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
 	if err := r.runGit(r.repoDir, "commit", "-m", "Install mailparse + yaml PECL extensions"); err != nil {
@@ -411,11 +614,35 @@ func (r *runner) commitAndPush() error {
 // waitForBuild uses the helper to poll cloud.image.version.list_all
 // until the latest version reports a terminal status. On failure we
 // fetch the full build trace via GetBuild and surface it.
+//
+// In JOURNEY_REUSE_IMAGE mode, fetch the latest already-built
+// version directly via ListAll (no waiting) so the version tag is
+// available to deployStack.
 func (r *runner) waitForBuild() error {
+	if os.Getenv("JOURNEY_REUSE_IMAGE") != "" {
+		resp, err := imgVersion.New(r.c).ListAll(r.ctx, imgVersion.ListAllRequest{
+			ImageID: r.imageID, SortBy: "date_added", SortDir: "DESC", PageSize: 1,
+		})
+		if err != nil {
+			return fmt.Errorf("version.ListAll for reuse: %w", err)
+		}
+		if len(resp.Return.Versions) == 0 {
+			return fmt.Errorf("reuse image %s has no built versions", r.imageCode)
+		}
+		v := resp.Return.Versions[0]
+		r.imageVersion = v.Version
+		log.Printf("    reusing latest build %s status=%s version=%s", v.BuildID, v.BuildStatus, v.Version)
+		if v.BuildStatus != cloudImage.BuildStatusSuccess {
+			return fmt.Errorf("latest build is %s, not success", v.BuildStatus)
+		}
+		return nil
+	}
+
 	v, err := cloudImage.New(r.c).WaitForBuild(r.ctx, r.imageID, imageBuildTimeout, imageBuildPoll)
 	if err != nil {
 		return fmt.Errorf("WaitForBuild: %w", err)
 	}
+	r.imageVersion = v.Version
 	log.Printf("    build %s: status=%s version=%s", v.BuildID, v.BuildStatus, v.Version)
 	if v.BuildStatus != cloudImage.BuildStatusSuccess {
 		// Fetch and surface the trace so the consumer (or AI agent)
@@ -450,34 +677,37 @@ func (r *runner) deployStack() error {
 	if r.siteIP == "" {
 		return fmt.Errorf("CCS %s not found or has no primary IP", r.serverName)
 	}
-	r.siteHost = fmt.Sprintf("%s.%s.sth.nz", r.stackName, r.siteIP)
+	// Stack names must come from cloud.stack.GenerateName (the API
+	// rejects custom names with "Unable to add stack, the hostname
+	// is invalid"). Override the synthetic name we set during setup.
+	gen, err := stack.New(r.c).GenerateName(r.ctx)
+	if err != nil {
+		return fmt.Errorf("cloud.stack.GenerateName: %w", err)
+	}
+	r.stackName = gen.Return.Name
+
+	// sth.nz wildcard DNS form: <subdomain>.<IP>.sth.nz.
+	r.siteHost = fmt.Sprintf("gosh.%s.sth.nz", r.siteIP)
 	r.siteURL = "http://" + r.siteHost
 
-	// docker-compose body for a single web container using our custom image.
-	composeYAML := fmt.Sprintf(`version: '3.7'
-services:
-  %s:
-    container_name: %s
-    image: registry-clients.sitehost.co.nz/%s/%s
-    restart: always
-    environment:
-      VIRTUAL_HOST: %s
-    labels:
-      nz.sitehost.container.image_update: "True"
-      nz.sitehost.container.label: "%s"
-      nz.sitehost.container.monitored: "True"
-      nz.sitehost.container.type: "www"
-networks:
-  default:
-    external:
-      name: infra_default
-`, r.stackName, r.stackName, "g_"+r.c.ClientID, r.imageCode, r.siteHost, r.imageLabel)
+	// docker-compose body matches build-a-site's working www-stack
+	// shape: nginx-proxy routes by VIRTUAL_HOST, the standard
+	// SiteHost volumes are mounted, and the image points at our
+	// freshly-built custom image.
+	// Image reference must include a version tag (the API rejects
+	// untagged refs with "There was no image version provided").
+	// imageVersion comes from WaitForBuild, e.g. "1.0-26356".
+	composeYAML := buildWWWCompose(r.stackName, r.siteHost,
+		fmt.Sprintf("registry-clients.sitehost.co.nz/g_%s/%s:%s",
+			r.c.ClientID, r.imageCode, r.imageVersion))
 
 	stackClient := stack.New(r.c)
 	resp, err := stackClient.Add(r.ctx, stack.AddRequest{
-		ServerName:  r.serverName,
-		Name:        r.stackName,
-		Label:       r.imageLabel,
+		ServerName: r.serverName,
+		Name:       r.stackName,
+		// Label MUST be the FQDN — the API rejects non-FQDN labels
+		// with "Error: Unable to add stack, the hostname is invalid".
+		Label:         r.siteHost,
 		DockerCompose: composeYAML,
 	})
 	if err != nil {
@@ -493,36 +723,46 @@ networks:
 	return nil
 }
 
-// probeExtensions SFTP-deploys a tiny phpinfo.php into the
-// container's public directory, then HTTP-fetches it and asserts
-// that both target extensions are loaded.
+// probeExtensions auto-provisions a container SSH user via
+// cloud.ssh.user.Add (same ssh.key authorized for it), SFTP-deploys
+// a phpinfo probe, HTTP-fetches it, and asserts both extensions are
+// runtime-loaded.
 func (r *runner) probeExtensions() error {
-	// We need a container SSH user to SFTP. Add the same key.
-	// (cloud.ssh.user lives in pkg/api/cloud/ssh/user; reusing the
-	// exact AddRequest plumbing from build-a-site is overkill here —
-	// for brevity we rely on the customer already having a
-	// container-user key on the CCS, OR a SFTP path via the platform.
-	// If your CCS doesn't, set SH_CCS_NAME to one that does or
-	// extend this example with cloud.ssh.user.Add.)
-	//
-	// Practically: most SiteHost CCSes already have a default SSH
-	// user; the example uses the locally-stored key + the env-supplied
-	// SFTP_USER (defaults to the container's stack name).
-	sftpUser := os.Getenv("SH_SFTP_USER")
-	if sftpUser == "" {
-		return fmt.Errorf("SH_SFTP_USER required (a container SSH user authorized for the test CCS)")
+	// 1. Provision a transient container SSH user scoped to our stack,
+	//    using the same ssh.key.Create-registered key.
+	r.containerUsername = "g" + randHex(7) // SSH usernames are length-limited
+	addResp, err := cloudSSHUser.New(r.c).Add(r.ctx, cloudSSHUser.AddRequest{
+		ServerName: r.serverName,
+		Username:   r.containerUsername,
+		Containers: []string{r.stackName},
+		SSHKeys:    []string{strconv.Itoa(r.keyID)},
+	})
+	if err != nil {
+		return fmt.Errorf("cloud.ssh.user.Add: %w", err)
 	}
+	r.createdContainerKey = true
+	if addResp.Return.ID > 0 {
+		if err := waitForJob(r.ctx, r.c, addResp.Return.ID, addResp.Return.Type, jobTimeout); err != nil {
+			return fmt.Errorf("cloud.ssh.user.Add job: %w", err)
+		}
+	}
+	log.Printf("    container ssh user %q scoped to stack %q", r.containerUsername, r.stackName)
 
+	// 2. SFTP a phpinfo probe into /container/application/public/.
 	const phpinfo = `<?php
 $mp = extension_loaded('mailparse');
 $yaml = extension_loaded('yaml');
 header('Content-Type: text/plain');
 echo "mailparse=" . ($mp ? "true" : "false") . "\n";
 echo "yaml=" . ($yaml ? "true" : "false") . "\n";
+echo "php_version=" . PHP_VERSION . "\n";
+echo "extension_dir=" . ini_get('extension_dir') . "\n";
+echo "loaded_inis=" . php_ini_loaded_file() . "\n";
+echo "scanned_inis=" . php_ini_scanned_files() . "\n";
 if (!$mp || !$yaml) { http_response_code(500); }
 `
 
-	if err := sftpDeploy(r.siteIP, sftpUser, r.keyPath, "/container/application/public/phpinfo.php", []byte(phpinfo)); err != nil {
+	if err := sftpDeploy(r.siteIP, r.containerUsername, r.keyPath, "/container/application/public/phpinfo.php", []byte(phpinfo)); err != nil {
 		return fmt.Errorf("sftp deploy: %w", err)
 	}
 
@@ -536,8 +776,61 @@ if (!$mp || !$yaml) { http_response_code(500); }
 	if !strings.Contains(body, "mailparse=true") || !strings.Contains(body, "yaml=true") {
 		return fmt.Errorf("extensions not loaded — body: %s", body)
 	}
-	log.Printf("    ✓ both extensions loaded")
+	log.Printf("    ✓ both extensions loaded at runtime")
 	return nil
+}
+
+func randHex(n int) string {
+	b := make([]byte, (n+1)/2)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)[:n]
+}
+
+// buildWWWCompose constructs the docker-compose body for a www-type
+// stack with the standard SiteHost volume mounts and nginx-proxy
+// routing labels. Mirrors the working pattern from
+// examples/build-a-site/buildWWWCompose, simplified to a single
+// hostname (no LE / multi-vhost handling).
+func buildWWWCompose(name, hostname, image string) string {
+	vhosts := hostname + ",www." + hostname
+	return fmt.Sprintf(`version: '2.1'
+services:
+    %s:
+        container_name: %s
+        environment:
+            - 'VIRTUAL_HOST=%s'
+            - CERT_NAME=%s
+        expose:
+            - 80/tcp
+        image: '%s'
+        labels:
+            - nz.sitehost.container.label=%s
+            - nz.sitehost.container.type=www
+            - nz.sitehost.container.monitored=True
+            - 'nz.sitehost.container.website.vhosts=%s'
+            - nz.sitehost.container.image_update=True
+            - nz.sitehost.container.production_mode=False
+            - nz.sitehost.container.backup_disable=False
+        restart: unless-stopped
+        volumes:
+            - '/data/docker0/www/%s/config:/container/config:ro'
+            - '/data/docker0/www/%s/logs:/container/logs:rw'
+            - '/data/docker0/www/%s/crontabs:/cron:ro'
+            - '/data/docker0/www/%s/application:/container/application:rw'
+            - '/data/docker0/www/%s/system:/container/system:rw'
+networks:
+    default:
+        external:
+            name: infra_default
+`,
+		name, name,
+		vhosts,
+		hostname,
+		image,
+		hostname,
+		vhosts,
+		name, name, name, name, name,
+	)
 }
 
 func (r *runner) cleanup() {
@@ -547,23 +840,70 @@ func (r *runner) cleanup() {
 	}
 	log.Printf("==> cleanup")
 
+	// Two-phase ssh-user delete: first call clears scoping, second
+	// removes the user. The first call queues a job; if we hit the
+	// second too quickly we get "job already running on this user".
+	// 10s between phases is enough for the first job to settle.
+	if r.createdContainerKey {
+		for i := 0; i < 2; i++ {
+			if _, err := cloudSSHUser.New(r.c).Delete(r.ctx, cloudSSHUser.DeleteRequest{
+				ServerName: r.serverName, Username: r.containerUsername,
+			}); err != nil {
+				log.Printf("    cloud.ssh.user.Delete (phase %d): %v", i+1, err)
+				break
+			}
+			if i == 0 {
+				time.Sleep(10 * time.Second)
+			}
+		}
+		log.Printf("    deleted container ssh user %s", r.containerUsername)
+	}
 	if r.createdStack {
-		_, err := stack.New(r.c).Delete(r.ctx, stack.DeleteRequest{
+		stackResp, err := stack.New(r.c).Delete(r.ctx, stack.DeleteRequest{
 			ServerName: r.serverName, Name: r.stackName,
 		})
 		if err != nil {
 			log.Printf("    cloud.stack.Delete: %v", err)
 		} else {
+			if stackResp.Return.ID > 0 {
+				if err := waitForJob(r.ctx, r.c, stackResp.Return.ID, stackResp.Return.Type, jobTimeout); err != nil {
+					log.Printf("    cloud.stack.Delete job: %v", err)
+				}
+			}
 			log.Printf("    deleted stack %s", r.stackName)
 		}
 	}
-	if r.createdImage {
-		_, err := cloudImage.New(r.c).Delete(r.ctx, cloudImage.DeleteRequest{Code: r.imageCode})
-		if err != nil {
-			log.Printf("    cloud.image.Delete: %v", err)
+	if r.createdImage && !r.keepImage {
+		// DeleteAndWait absorbs the "could not delete your custom
+		// image right now" transient.
+		if err := cloudImage.New(r.c).DeleteAndWait(r.ctx, r.imageCode, 5, jobTimeout, 10*time.Second); err != nil {
+			log.Printf("    cloud.image.DeleteAndWait: %v", err)
 		} else {
 			log.Printf("    deleted image %s", r.imageCode)
 		}
+	} else if r.createdImage && r.keepImage {
+		log.Printf("    JOURNEY_KEEP_IMAGE=1 — leaving image %s", r.imageCode)
+	}
+	if r.provisionedCCS && !r.keepCCS {
+		// Force=true adds force_delete=1, required because the
+		// platform auto-deploys an infra stack on every fresh CCS
+		// that plain Delete refuses to remove. (See
+		// docs/open-api-questions.md "Server.Delete force option".)
+		delResp, err := server.New(r.c).Delete(r.ctx, server.DeleteRequest{
+			Name: r.serverName, Force: true,
+		})
+		if err != nil {
+			log.Printf("    server.Delete: %v", err)
+		} else {
+			if delResp.Return.ID > 0 {
+				if werr := waitForJob(r.ctx, r.c, delResp.Return.ID, delResp.Return.Type, ccsProvisionTimeout); werr != nil {
+					log.Printf("    server.Delete job: %v", werr)
+				}
+			}
+			log.Printf("    deprovisioned CCS %s", r.serverName)
+		}
+	} else if r.provisionedCCS && r.keepCCS {
+		log.Printf("    JOURNEY_KEEP_CCS=1 — leaving CCS %s", r.serverName)
 	}
 	if r.createdSSHKey {
 		_, err := sshKey.New(r.c).Delete(r.ctx, sshKey.DeleteRequest{ID: strconv.Itoa(r.keyID)})
@@ -582,14 +922,18 @@ func (r *runner) cleanup() {
 }
 
 // runGit invokes git in the given working dir with GIT_SSH_COMMAND
-// pointed at our ephemeral private key (so the GitLab clone/push
-// authenticates as the registered ssh.key).
+// pointed at our ephemeral private key. Optionally injects -o
+// ProxyJump=<spec> when JOURNEY_GIT_PROXY_JUMP is set, so consumers
+// outside the SiteHost / NZ network can route through a bastion
+// without changing the helper-constructed clone URL.
 func (r *runner) runGit(dir string, args ...string) error {
+	sshCmd := fmt.Sprintf("ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", r.keyPath)
+	if pj := os.Getenv("JOURNEY_GIT_PROXY_JUMP"); pj != "" {
+		sshCmd += " -o ProxyJump=" + pj
+	}
 	cmd := exec.CommandContext(r.ctx, "git", args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("GIT_SSH_COMMAND=ssh -i %s -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", r.keyPath),
-	)
+	cmd.Env = append(os.Environ(), "GIT_SSH_COMMAND="+sshCmd)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, string(out))
@@ -640,17 +984,17 @@ func sftpDeploy(host, user, keyPath, remotePath string, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("read key: %w", err)
 	}
-	signer, err := ssh.ParsePrivateKey(keyBytes)
+	signer, err := gossh.ParsePrivateKey(keyBytes)
 	if err != nil {
 		return fmt.Errorf("parse key: %w", err)
 	}
-	cfg := &ssh.ClientConfig{
+	cfg := &gossh.ClientConfig{
 		User:            user,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Auth:            []gossh.AuthMethod{gossh.PublicKeys(signer)},
+		HostKeyCallback: gossh.InsecureIgnoreHostKey(),
 		Timeout:         15 * time.Second,
 	}
-	sshConn, err := ssh.Dial("tcp", host+":22", cfg)
+	sshConn, err := gossh.Dial("tcp", host+":22", cfg)
 	if err != nil {
 		return fmt.Errorf("ssh dial: %w", err)
 	}
@@ -678,37 +1022,14 @@ func randomSuffix() string {
 }
 
 // openSSHPrivateKey encodes an ed25519 private key in OpenSSH PEM
-// format. Stripped-down from build-a-site's helper of the same shape.
+// format using the upstream ssh.MarshalPrivateKey helper. (Earlier
+// hand-rolled binary serialisation produced files that
+// /usr/bin/ssh rejected as "invalid format".)
 func openSSHPrivateKey(priv ed25519.PrivateKey) ([]byte, error) {
-	const magic = "openssh-key-v1\x00"
-	pub := priv.Public().(ed25519.PublicKey)
-	pubW := ssh.Marshal(struct {
-		KeyType string
-		Pub     []byte
-	}{"ssh-ed25519", pub})
-	checkint := uint32(time.Now().UnixNano())
-	privW := ssh.Marshal(struct {
-		Check1, Check2 uint32
-		Keytype        string
-		Pub            []byte
-		Priv           []byte
-		Comment        string
-	}{checkint, checkint, "ssh-ed25519", pub, []byte(priv), "gosh-customimg"})
-	// pad to 8-byte multiple
-	for len(privW)%8 != 0 {
-		privW = append(privW, byte(len(privW)%8+1))
+	block, err := gossh.MarshalPrivateKey(priv, "gosh-customimg")
+	if err != nil {
+		return nil, err
 	}
-	header := struct {
-		CipherName, KdfName string
-		KdfOpts             string
-		NumKeys             uint32
-		PubKey              []byte
-		PrivBlob            []byte
-	}{"none", "none", "", 1, pubW, privW}
-	body := append([]byte(magic), ssh.Marshal(header)...)
-	return pem.EncodeToMemory(&pem.Block{
-		Type:  "OPENSSH PRIVATE KEY",
-		Bytes: body,
-	}), nil
+	return pem.EncodeToMemory(block), nil
 }
 

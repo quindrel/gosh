@@ -118,232 +118,32 @@ Until then, deferred.
 
 ---
 
-## Custom-image GitLab — undocumented per-IP rate limiting
+## Behavioural / actionable issues — see `docs/api-issues/`
 
-Public docs (`https://kb.sitehost.nz/cloud-containers/custom-images/`)
-present `git clone git@gitlab-clients.sitehost.co.nz:g_<id>/<code>.git`
-as an ordinary git-over-SSH workflow. Reality, observed during
-`examples/custom-image-smoke` and `examples/custom-image` validation
-in May 2026 from a Philippines-based developer machine:
+The following items have been moved into individual files under
+[`docs/api-issues/`](api-issues/) so they can be tracked, filed
+upstream, and updated independently. They're listed here for
+discoverability:
 
-- A single, clean `git clone` from any IP (international or NZ-side)
-  succeeds. The port-22 endpoint is **not** geo-blocked — earlier
-  observations to the contrary turned out to be the rate-limit
-  effect described next, not a geo restriction.
-- After a small number of SSH attempts in quick succession (the
-  smoke's original 6× retry loop reliably triggered it), the source
-  IP gets temporarily blocked at the TCP layer — `nc -zv` against
-  port 22 returns "connection refused" for several minutes. After a
-  cooldown, connectivity returns. Behaviour is consistent with
-  fail2ban-style per-IP banning at GitLab's edge.
-- Port 443 (HTTPS) stays reachable throughout, suggesting the rate
-  limit is SSH-specific rather than a generic per-IP TCP block.
-
-The KB article closest to this concern
-(`/cloud-containers/custom-images/access-via-ssh`) only documents
-SSH-key-as-account-credential semantics. There is no mention of:
-
-- the per-IP SSH rate limit / fail2ban behaviour,
-- the recommended retry strategy (single-attempt, no aggressive
-  loops),
-- HTTPS-clone-with-PAT as a possible alternative.
-
-**Open questions:**
-
-- What's the actual ban threshold (failed attempts per minute, total
-  per hour, etc.) and cooldown duration? Knowing this would let SDKs
-  pick a safe retry policy.
-- Is HTTPS git clone with a personal access token supported on
-  port 443? A PAT-based path would let consumers iterate without
-  the SSH-rate-limit risk.
-
-**Mitigations adopted by gosh examples:**
-
-1. **Single-attempt clone** (no retry loop). The smoke and
-   custom-image examples take exactly one shot at the clone after a
-   5-second wait for GitLab repo provisioning to settle.
-2. **`JOURNEY_GIT_PROXY_JUMP`** env var injects `-o ProxyJump=...`
-   into `GIT_SSH_COMMAND` so consumers can route git through a
-   bastion. Useful for hopping through a SiteHost-network jump host
-   when iterating heavily, but **not required for normal
-   single-attempt use** from an international IP.
-3. Failed-delete jobs are a downstream symptom of the same
-   underlying state: if the GitLab project never accepted a first
-   push, `cloud.image.Delete` sometimes returns the transient
-   "could not delete" error and orphans the metadata record.
-   `examples/probe-images` with `CLEANUP_IMAGE_PREFIX=` provides
-   the manual recovery path; `cloud.image.DeleteAndWait` absorbs
-   the transient automatically.
-
-**Resolution paths:**
-
-- KB / API docs add a "Network access" section to the custom-image
-  pages mentioning the rate-limit behaviour and recommending the
-  single-attempt pattern.
-- If HTTPS clone is supported, document the auth flow (PAT
-  generation, URL form) so SDKs can offer an HTTPS path.
-
----
-
-## Per-CCS write-time resource gate (cause unconfirmed)
-
-`cloud/stack/add.json` against an existing CCS sometimes returns:
-
-```
-Unable to update stack, the number of new images required exceeds
-the number of available images on this server.
-```
-
-Observed in May 2026 against `ch-faraday` (product `905`), which
-had 17 stacks deployed at the time. The gate is real and enforced
-at write-time; what it *measures* is unclear from the public APIs:
-
-- `cloud.server.List` exposes `images_remaining` and
-  `containers_remaining` per CCS — both `0` for ch-faraday — but
-  also `images_used=[]` (count 0). The two values don't add up,
-  so the displayed quota state isn't a reliable read of the live
-  cap.
-- `server/list_resources` is account-level (VPS Disk + Memory only)
-  — no per-CCS image cap visible. Notably, the account had
-  `available_units=-100` for VPS Disk Space at the time of the
-  failure, which could equally be the actual gate.
-
-**Open question:** what does the "available images" check actually
-measure — a per-CCS image-count cap, host disk space, container
-count, or something else? The error message is ambiguous and the
-read-side APIs don't surface enough state to disambiguate.
-
-**Workaround used in `examples/custom-image`:** when
-`JOURNEY_PROVISION_CCS=1` is set, the example provisions a fresh
-CCS in AKLCITY (zero-cost staff region) just for the run, sidestepping
-whatever resource cap exists on shared / loaded CCSes. CCS provision
-+ teardown adds ~10 minutes total; reuse modes
-(`JOURNEY_KEEP_CCS=1`, `JOURNEY_REUSE_IMAGE=...`) let consumers
-amortise the cost across iterative runs.
-
-**Resolution paths:**
-
-- API surfaces a clearer error code and a precise per-CCS resource
-  view (used vs cap for whatever the gate actually measures).
-- If the gate is in fact image-count, the `cloud.server.List` view's
-  `images_used` / `images_remaining` semantics get fixed so the
-  values are usable for capacity planning.
-
----
-
-## `cloud.image.Delete` rejects fresh / just-built images
-
-`cloud/image/delete.json` returns success at the API layer
-(`status:true`) but its scheduler job can come back as `Failed` with
-the verbatim message:
-
-```
-We could not delete your custom image right now. Please contact
-support@sitehost.co.nz
-```
-
-Empirically this is *transient*: the same delete call succeeds a
-few seconds later. It appears to fire when a delete is issued too
-soon after a build/push completes — e.g. immediately after a
-fresh `cloud.image.Create` or right after a CI job ends. Likely a
-GC / lock window on the platform side; the customer-facing error
-points at support but no contact is actually needed.
-
-**Operational impact:** Without retry, every fresh-image cleanup
-fails on the first attempt and orphans the metadata record. AI
-agents driving the SDK accumulate these orphans run-over-run with
-no indication that the cleanup didn't actually take.
-
-**Discoverability gap:** the error message is misleading — it
-implies a permanent / support-needed condition, when in practice
-a 10-second backoff and retry succeeds. The KB does not document
-this behaviour; the API docs don't either.
-
-**Mitigation in gosh:** `cloud.image.DeleteAndWait` (helper) wraps
-`Delete` + scheduler-job polling, recognises the transient by
-substring match on the job's Message field, and retries with
-backoff up to N attempts. Examples should always cleanup via the
-helper rather than bare `Delete`.
-
-Tracked as a sharper actionable bug report at
-[`docs/api-issues/cloud-image-delete-transient.md`](api-issues/cloud-image-delete-transient.md).
-
----
-
-## PECL extension installs don't auto-enable on `sitehost-php*-apache`
-
-When forking `sitehost-php85-apache` (and likely the other apache
-PHP base images) and adding a PECL extension via the standard
-incantation:
-
-```dockerfile
-RUN apt-get install -y libyaml-dev php-pear php-dev \
-    && pecl install mailparse yaml \
-    && phpenmod -v ALL mailparse yaml
-```
-
-…the `pecl install` step succeeds (`install ok: channel://
-pecl.php.net/{mailparse,yaml}` appears in the build trace) and the
-`.so` files land in `/usr/local/lib/php/extensions/`, but PECL
-emits a warning the trace makes plain:
-
-```
-configuration option "php_ini" is not set to php.ini location
-You should add "extension=mailparse.so" to php.ini
-```
-
-`phpenmod`'s own output is silent (no `Extension … enabled` line
-appears) — suggesting it didn't find anything to enable, because
-PECL installed under `/usr/local/...` rather than the system path
-`phpenmod` scans (`/etc/php/<v>/mods-available/`). The end result
-is that extension `.so` files are **present but not loaded at
-runtime**.
-
-**Operational impact:** A purely build-time check (e.g. trace
-assertion that PECL install lines appear) would show a green
-build, but `extension_loaded('mailparse')` at runtime would
-return false. The customer / AI agent only finds out when their
-application throws at runtime.
-
-**Discoverability gap:** The KB's custom-images section explains
-how to author a Dockerfile but doesn't document:
-
-- Where the parent image's PHP install actually lives
-  (`/usr/local` vs system `/etc/php/<v>/`).
-- The right way to drop in an extension `.ini` so it's picked up
-  by Apache + mod_php on first start.
-- That `phpenmod -v ALL` is a no-op for PECL-installed extensions
-  on these base images.
-
-**Workaround (not yet validated by gosh, listed as candidates):**
-
-- Write the `extension=<name>.so` line directly into the path PHP
-  reads — likely `/usr/local/etc/php/conf.d/<name>.ini` (or wherever
-  this base image expects per-extension config). A short `RUN echo
-  "extension=mailparse.so" > <path>/mailparse.ini` after the PECL
-  step, but the *correct* path depends on the parent image's
-  layout.
-- `pecl install -d php_ini=<path>` to point PECL at the right
-  php.ini at install time so it auto-appends.
-- A SiteHost-published Dockerfile snippet for adding extensions to
-  each `sitehost-php*-apache` base, mirroring the pattern in the
-  rest of the cloud-containers docs.
-
-**Open questions:**
-
-- Where exactly does PHP look for extension `.ini` files inside
-  `sitehost-php85-apache:1.0.1-noble`? Confirming once would let
-  the SDK / docs prescribe the canonical install pattern.
-- Is there a SiteHost-supplied helper script inside the base image
-  for installing PECL extensions correctly (analogous to the
-  official PHP image's `docker-php-ext-enable`)?
-
-**Validation status:** unverified at runtime. To confirm/refute,
-deploy a stack from the smoke-built image and check `phpinfo()`
-or `php -m` against the running container — the smoke's pecl mode
-asserts only build-time install, not runtime loading. This is
-exactly the gap that `examples/custom-image` (Phase 2: stack
-deploy + phpinfo probe) is intended to close.
+- [`gitlab-per-ip-ssh-rate-limit.md`](api-issues/gitlab-per-ip-ssh-rate-limit.md)
+  — undocumented per-IP SSH rate limiting on
+  `gitlab-clients.sitehost.co.nz:22`.
+- [`ccs-write-time-resource-gate.md`](api-issues/ccs-write-time-resource-gate.md)
+  — `cloud.stack.Add` "exceeds available images" with no
+  reliable read-side capacity view.
+- [`cloud-image-delete-transient.md`](api-issues/cloud-image-delete-transient.md)
+  — `cloud.image.Delete` returns success then the scheduler job
+  fails with a misleading "contact support" message; resolves
+  on retry.
+- [`pecl-extensions-not-auto-enabled.md`](api-issues/pecl-extensions-not-auto-enabled.md)
+  — PECL extension installs build green but don't load at
+  runtime on `sitehost-php*-apache` images.
+- [`cloud-stack-add-label-must-be-fqdn.md`](api-issues/cloud-stack-add-label-must-be-fqdn.md)
+  — `cloud.stack.Add` `label` field is the primary FQDN; field
+  name and rejection message both obscure that.
+- [`cloud-stack-add-image-version-required.md`](api-issues/cloud-stack-add-image-version-required.md)
+  — `cloud.stack.Add` requires explicit image version tag with
+  no `:latest` shortcut.
 
 ---
 

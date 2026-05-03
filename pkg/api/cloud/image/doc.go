@@ -61,14 +61,59 @@
 //     /cloud/stack/image/list_all, not /cloud/image/list_all.
 //     ForkFromImage does the lookup automatically.
 //
-// # Network requirements (consumers running outside the SiteHost network)
+// # Network notes for git+ssh access
 //
-// gitlab-clients.sitehost.co.nz:22 appears geo-restricted: TCP
-// connections from outside SiteHost's New Zealand network may be
-// firewalled. AI agents driving this from outside NZ typically need
-// either a SiteHost-network bastion (use SSH ProxyJump in
-// GIT_SSH_COMMAND) or an explicit firewall exception via SiteHost
-// support. HTTPS port 443 is reachable from international IPs but
-// authentication via HTTPS git operations hasn't been validated by
-// this SDK's authors.
+// gitlab-clients.sitehost.co.nz:22 is reachable from international
+// IPs — a single, clean `git clone` works fine from non-NZ
+// sources, validated end-to-end. There is, however, **per-IP SSH
+// rate limiting / fail2ban at GitLab's edge**: a small number of
+// retried SSH attempts from the same source IP gets that IP
+// temporarily TCP-refused on port 22 for several minutes. Take
+// **single-attempt clones**, not retry loops — the loops are the
+// trigger, not the recovery. Earlier "blocked from international
+// IPs" framing in this doc was the rate-limit hangover misread as
+// a geofence.
+//
+// Optional escape hatch: examples/custom-image-smoke and
+// examples/custom-image both honour a JOURNEY_GIT_PROXY_JUMP
+// env var that injects `-o ProxyJump=...` into GIT_SSH_COMMAND,
+// useful for callers iterating heavily who'd rather route through
+// a bastion's IP. Not required for normal use. See
+// docs/api-issues/gitlab-per-ip-ssh-rate-limit.md.
+//
+// # Runtime gotcha: PECL extensions don't auto-load on `sitehost-php*-apache`
+//
+// When forking `sitehost-php85-apache` (and likely sibling apache
+// PHP base images) and adding a PECL extension via the obvious
+// pattern:
+//
+//	RUN apt-get install -y libyaml-dev php-pear php-dev \
+//	    && pecl install mailparse yaml \
+//	    && phpenmod -v ALL mailparse yaml
+//
+// the build trace goes green ("install ok: channel://..."), but
+// `extension_loaded()` at runtime returns false. The reason:
+//
+//   - SiteHost's PHP base image's extension_dir is
+//     /lib/php/extensions (not the Debian default
+//     /usr/lib/php/<api>/).
+//   - PECL writes the .so to /usr/local/lib/php/extensions/<name>.so.
+//   - The loaded ini path is /container/config/php/php.ini, with
+//     scanned ini directory /container/config/php/conf.d/ (a
+//     volume-mounted path populated from default-data/config/php/
+//     conf.d/ in the image repo).
+//   - phpenmod scans /etc/php/<v>/mods-available/ and silently
+//     no-ops because PECL didn't put anything there.
+//
+// Working pattern (validated live, see examples/custom-image):
+//
+//   - Dockerfile: `apt-get install -y libyaml-dev php-pear php-dev
+//     && pecl install <ext>` — install only, no enable step.
+//   - Repo: write
+//     default-data/config/php/conf.d/<ext>.ini containing
+//     `extension=/usr/local/lib/php/extensions/<ext>.so` (absolute
+//     path).
+//
+// See docs/api-issues/pecl-extensions-not-auto-enabled.md for the
+// full empirical breakdown.
 package image

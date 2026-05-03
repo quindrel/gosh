@@ -35,26 +35,27 @@
 // This proves the round-trip mechanically before tackling the
 // harder content-specific tests (PECL extensions, runtime probes).
 //
-// # Network requirements
+// # Network notes
 //
 // gitlab-clients.sitehost.co.nz:22 (the SSH endpoint for custom
-// image repositories) appears to be geo-restricted: connections
-// from outside SiteHost's New Zealand network are blocked at the
-// firewall (TCP refused on port 22). For AI agents driving this
-// SDK from outside NZ:
+// image repositories) is reachable from international IPs — a
+// single, clean `git clone` works fine from a Philippines source,
+// validated end-to-end. There is, however, **per-IP SSH rate
+// limiting / fail2ban** at GitLab's edge: a small number of
+// retried SSH attempts from the same source IP gets that IP
+// temporarily TCP-refused on port 22 for several minutes. The
+// smoke takes exactly one attempt at the clone for this reason —
+// retry loops are the trigger, not the recovery.
 //
-//   - Easiest: SSH-tunnel via a SiteHost VM by setting
-//     JOURNEY_GIT_PROXY_JUMP=user@host (e.g.
-//     "ubuntu@45.113.8.110"). The smoke injects -o ProxyJump=…
-//     into GIT_SSH_COMMAND so all git+ssh ops route through the
-//     bastion transparently.
-//   - Alternative: open a SiteHost support ticket to allow the
-//     consumer's IP to reach gitlab-clients.sitehost.co.nz:22 directly.
-//   - Or: run this example from inside a SiteHost (NZ) VM in the
-//     first place.
+// Optional escape hatch: JOURNEY_GIT_PROXY_JUMP=user@host injects
+// `-o ProxyJump=...` into GIT_SSH_COMMAND, useful when iterating
+// heavily from a single dev IP and you'd rather absorb a ban via
+// a bastion's IP.
 //
-// HTTPS git over port 443 may also be available (the host responds
-// on 443) but we haven't validated PAT-based auth via HTTPS.
+// HTTPS git over port 443 also responds but PAT-based auth has
+// not been validated by this SDK's authors. See
+// docs/open-api-questions.md "Custom-image GitLab — undocumented
+// per-IP rate limiting" for the full empirical picture.
 //
 // Required env:
 //

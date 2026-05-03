@@ -89,7 +89,14 @@
 // External requirements:
 //   - The local `git` binary in PATH (the helper relies on it for
 //     clone + push; gosh deliberately doesn't bundle a git client).
-//   - Outbound SSH to gitlab-clients.sitehost.co.nz:22.
+//   - Outbound SSH to gitlab-clients.sitehost.co.nz:22. Reachable
+//     from international IPs (validated from a Philippines source);
+//     the example uses a single-attempt clone because GitLab's edge
+//     enforces per-IP SSH rate limiting that aggressive retry loops
+//     reliably trigger. JOURNEY_GIT_PROXY_JUMP routes via a bastion
+//     for callers who want to absorb a rate-limit hit via a
+//     different source IP, but it's optional. See
+//     docs/open-api-questions.md.
 //
 // This is dogfood: every API interaction goes through gosh. Git
 // clone/push is the one external tool — we shell out to git rather

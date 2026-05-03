@@ -118,68 +118,116 @@ Until then, deferred.
 
 ---
 
-## Custom-image GitLab — undocumented network restrictions
+## Custom-image GitLab — undocumented per-IP rate limiting
 
 Public docs (`https://kb.sitehost.nz/cloud-containers/custom-images/`)
 present `git clone git@gitlab-clients.sitehost.co.nz:g_<id>/<code>.git`
 as an ordinary git-over-SSH workflow. Reality, observed during
-`examples/custom-image-smoke` validation in May 2026:
+`examples/custom-image-smoke` and `examples/custom-image` validation
+in May 2026 from a Philippines-based developer machine:
 
-- Direct connections from international IPs (Philippines source, in
-  this case) to `gitlab-clients.sitehost.co.nz:22` get TCP "connection
-  refused" — the port is not reachable at all from outside the
-  SiteHost / NZ network.
-- From a SiteHost cloud container in NZ (verified against both
-  `45.113.8.110` and `223.165.71.164`), `nc -zv` to port 22 succeeds
-  on the *first* probe but subsequent SSH attempts return "connection
-  refused" at the TCP layer for several minutes. Behaviour is
-  consistent with per-source-IP rate limiting / fail2ban-style
-  banning at GitLab's edge.
-- Port 443 (HTTPS) stays reachable from international IPs throughout.
-- The git-over-SSH retry loop (e.g. `examples/custom-image-smoke`
-  trying 6× with 10s spacing) appears to *cause* the ban rather than
-  recover from it; first-attempt failures should not be retried
-  aggressively.
+- A single, clean `git clone` from any IP (international or NZ-side)
+  succeeds. The port-22 endpoint is **not** geo-blocked — earlier
+  observations to the contrary turned out to be the rate-limit
+  effect described next, not a geo restriction.
+- After a small number of SSH attempts in quick succession (the
+  smoke's original 6× retry loop reliably triggered it), the source
+  IP gets temporarily blocked at the TCP layer — `nc -zv` against
+  port 22 returns "connection refused" for several minutes. After a
+  cooldown, connectivity returns. Behaviour is consistent with
+  fail2ban-style per-IP banning at GitLab's edge.
+- Port 443 (HTTPS) stays reachable throughout, suggesting the rate
+  limit is SSH-specific rather than a generic per-IP TCP block.
 
-The KB article that's closest to this concern
+The KB article closest to this concern
 (`/cloud-containers/custom-images/access-via-ssh`) only documents
 SSH-key-as-account-credential semantics. There is no mention of:
 
-- source-IP allow-listing requirements,
-- rate-limiting / fail2ban behaviour,
-- HTTPS-clone-with-PAT as a possible alternative,
-- or that running from outside NZ may need operator support.
+- the per-IP SSH rate limit / fail2ban behaviour,
+- the recommended retry strategy (single-attempt, no aggressive
+  loops),
+- HTTPS-clone-with-PAT as a possible alternative.
 
-**Open question:** what is the supported way to reach
-`gitlab-clients.sitehost.co.nz:22` from an external developer
-machine or CI runner that doesn't live in the SiteHost network?
-Is HTTPS clone with a personal access token supported on port 443?
+**Open questions:**
 
-**Operational impact for AI agents:** this is the #1 blocker for
-SDK consumers driving `cloud.image` workflows from outside the NZ
-network. Until clarified, examples should:
+- What's the actual ban threshold (failed attempts per minute, total
+  per hour, etc.) and cooldown duration? Knowing this would let SDKs
+  pick a safe retry policy.
+- Is HTTPS git clone with a personal access token supported on
+  port 443? A PAT-based path would let consumers iterate without
+  the SSH-rate-limit risk.
 
-1. Document the constraint prominently (see
-   `examples/custom-image-smoke` package comment).
-2. Default the retry loop to single-attempt with long backoff
-   rather than aggressive retries that worsen the problem.
-3. Surface a `JOURNEY_GIT_PROXY_JUMP` env var so consumers with
-   bastion access can route through it without SDK changes.
-4. Flag failed-delete jobs as a downstream symptom: if the GitLab
-   project never accepted a first push, `cloud.image.Delete`
-   sometimes returns `"We could not delete your custom image right
-   now"` and orphans the metadata record. `examples/probe-images`
-   with `CLEANUP_IMAGE_PREFIX=` provides the manual recovery path.
+**Mitigations adopted by gosh examples:**
+
+1. **Single-attempt clone** (no retry loop). The smoke and
+   custom-image examples take exactly one shot at the clone after a
+   5-second wait for GitLab repo provisioning to settle.
+2. **`JOURNEY_GIT_PROXY_JUMP`** env var injects `-o ProxyJump=...`
+   into `GIT_SSH_COMMAND` so consumers can route git through a
+   bastion. Useful for hopping through a SiteHost-network jump host
+   when iterating heavily, but **not required for normal
+   single-attempt use** from an international IP.
+3. Failed-delete jobs are a downstream symptom of the same
+   underlying state: if the GitLab project never accepted a first
+   push, `cloud.image.Delete` sometimes returns the transient
+   "could not delete" error and orphans the metadata record.
+   `examples/probe-images` with `CLEANUP_IMAGE_PREFIX=` provides
+   the manual recovery path; `cloud.image.DeleteAndWait` absorbs
+   the transient automatically.
 
 **Resolution paths:**
 
-- SiteHost ops whitelists the consumer's IP / IP range against the
-  GitLab edge firewall (best for individual consumers).
 - KB / API docs add a "Network access" section to the custom-image
-  pages capturing whichever option above is supported.
+  pages mentioning the rate-limit behaviour and recommending the
+  single-attempt pattern.
 - If HTTPS clone is supported, document the auth flow (PAT
-  generation, header format) so SDKs can offer an HTTPS path that
-  doesn't depend on SSH allow-listing.
+  generation, URL form) so SDKs can offer an HTTPS path.
+
+---
+
+## Per-CCS write-time resource gate (cause unconfirmed)
+
+`cloud/stack/add.json` against an existing CCS sometimes returns:
+
+```
+Unable to update stack, the number of new images required exceeds
+the number of available images on this server.
+```
+
+Observed in May 2026 against `ch-faraday` (product `905`), which
+had 17 stacks deployed at the time. The gate is real and enforced
+at write-time; what it *measures* is unclear from the public APIs:
+
+- `cloud.server.List` exposes `images_remaining` and
+  `containers_remaining` per CCS — both `0` for ch-faraday — but
+  also `images_used=[]` (count 0). The two values don't add up,
+  so the displayed quota state isn't a reliable read of the live
+  cap.
+- `server/list_resources` is account-level (VPS Disk + Memory only)
+  — no per-CCS image cap visible. Notably, the account had
+  `available_units=-100` for VPS Disk Space at the time of the
+  failure, which could equally be the actual gate.
+
+**Open question:** what does the "available images" check actually
+measure — a per-CCS image-count cap, host disk space, container
+count, or something else? The error message is ambiguous and the
+read-side APIs don't surface enough state to disambiguate.
+
+**Workaround used in `examples/custom-image`:** when
+`JOURNEY_PROVISION_CCS=1` is set, the example provisions a fresh
+CCS in AKLCITY (zero-cost staff region) just for the run, sidestepping
+whatever resource cap exists on shared / loaded CCSes. CCS provision
++ teardown adds ~10 minutes total; reuse modes
+(`JOURNEY_KEEP_CCS=1`, `JOURNEY_REUSE_IMAGE=...`) let consumers
+amortise the cost across iterative runs.
+
+**Resolution paths:**
+
+- API surfaces a clearer error code and a precise per-CCS resource
+  view (used vs cap for whatever the gate actually measures).
+- If the gate is in fact image-count, the `cloud.server.List` view's
+  `images_used` / `images_remaining` semantics get fixed so the
+  values are usable for capacity planning.
 
 ---
 

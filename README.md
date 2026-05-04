@@ -119,7 +119,7 @@ to end.
 
 | Branch | LoC | Surface |
 |---|---|---|
-| `feat/srs` | 1,376 | Registry reads + .nz domain lifecycle — 16 endpoints. Writes (~20 more) still in flight. |
+| `feat/srs` | 3,069 | Full registry namespace — 37 endpoints (reads + .nz domain lifecycle + contact CRUD + nameserver / UDAI / transfer / email-template writes). Live-validated against gosh-srs-test.nz. Folds the prior tier-1/tier-2 SRS branches. |
 
 ### Aggregated working tree (`feat/examples`)
 

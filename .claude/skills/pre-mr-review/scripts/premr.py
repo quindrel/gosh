@@ -764,6 +764,116 @@ def check_sibling_sites(rep: Report, base: str) -> None:
 
 # --------------------------------------------------------------------
 
+
+# --------------------------------------------------------------------
+# 11. Rejection fixtures that cannot prove a rejection
+# --------------------------------------------------------------------
+
+def check_rejection_fixtures(rep: Report) -> None:
+    """Fixtures cited as rejections that carry no status field.
+
+    This API has two rejection shapes: a 200 carrying
+    `"status": false`, and a 400 whose body carries only a `msg`. A
+    fixture of the second kind decodes `status` to Go's zero value,
+    which is also false — so a test asserting "this was rejected"
+    passes on the zero value rather than on anything recorded, and
+    would pass identically against a fixture recording nothing at all.
+
+    That is a question, not a defect, and this check is a REVIEW line
+    for a reason worth stating: the first version reported CONFIRMED,
+    and the first fixture it flagged turned out to be a faithful
+    recording of a real 400 with no status field. Both halves have to
+    hold — the fixture must be unable to prove the rejection *and* the
+    response must not really be that shape — and the second half is
+    only answerable by looking.
+
+    Found this way: a fixture named for an unknown zone contained only
+    {"msg": "Please specify a valid domain name."}. The test passed, and
+    the recorded rejection turned out to be the TLD validator refusing
+    to parse the name rather than the not-found it was cited for. Two
+    doc comments and three tests encoded the wrong conclusion.
+    """
+    for dirpath, _, names in os.walk("."):
+        if "/testdata" not in dirpath or "/.git" in dirpath:
+            continue
+        for n in sorted(names):
+            if not n.endswith(".json"):
+                continue
+            # Only fixtures whose name says they hold a rejection.
+            if not re.search(r"(reject|error|unknown|invalid|missing|denied|notfound|not-found)", n, re.I):
+                continue
+            path = os.path.join(dirpath, n)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    doc = json.load(fh)
+            except Exception:
+                continue
+            if not isinstance(doc, dict):
+                continue
+            if "status" not in doc:
+                rep.review(
+                    "rejection-fixture", path,
+                    "is named as a rejection but carries no \"status\" field, so a "
+                    "test asserting the rejection passes on Go's zero value; confirm "
+                    "the API really answers that way and that the message is the "
+                    "rejection the test cites, not a different one",
+                )
+            elif doc.get("status") is True:
+                rep.review(
+                    "rejection-fixture", path,
+                    "is named as a rejection but records status:true; confirm the "
+                    "name describes what was actually observed",
+                )
+
+
+# --------------------------------------------------------------------
+# 12. Assertions removed from tests
+# --------------------------------------------------------------------
+
+def check_dropped_assertions(rep: Report, base: str) -> None:
+    """Test files that lose more assertions than they gain.
+
+    Replacing a hand-written test with a fixture-backed one is often
+    right, and it is also how coverage disappears without anything
+    turning red: the two kinds catch disjoint bugs, so swapping one for
+    the other silently drops whatever only the first could see.
+
+    Found this way: a rewrite replaced two tests with three
+    fixture-backed ones. The fixture tests could not detect a swapped
+    json tag or a wrong endpoint path — both were mutated and the suite
+    still reported ok — because a scrubbed fixture's values are all
+    placeholders and the serving helper ignores the path.
+    """
+    diff = subprocess.run(
+        ["git", "diff", "-U0", f"{base}...HEAD", "--", "*_test.go"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+
+    assertion = re.compile(r"\b(t\.Errorf|t\.Error|t\.Fatalf|t\.Fatal)\b")
+    per_file: dict[str, list[int]] = {}
+    current = None
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+            per_file.setdefault(current, [0, 0])
+            continue
+        if current is None:
+            continue
+        if line.startswith("-") and assertion.search(line):
+            per_file[current][0] += 1
+        elif line.startswith("+") and assertion.search(line):
+            per_file[current][1] += 1
+
+    for path, (removed, added) in sorted(per_file.items()):
+        if removed > added:
+            rep.review(
+                "dropped-assertions", path,
+                f"removes {removed} assertion(s) and adds {added}; confirm nothing "
+                f"the old ones caught is now unchecked — a fixture test and a "
+                f"literal-comparison test catch disjoint bugs",
+            )
+
+
 CHECKS = [
     ("wire contracts", check_wire_contracts, False),
     ("empty-collection tolerance", check_empty_shapes, False),
@@ -775,6 +885,8 @@ CHECKS = [
     ("documented but not read", check_documented_env, False),
     ("absolute claims", check_absolute_claims, True),
     ("sibling sites", check_sibling_sites, True),
+    ("rejection fixtures", check_rejection_fixtures, False),
+    ("dropped assertions", check_dropped_assertions, True),
 ]
 
 

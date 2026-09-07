@@ -295,6 +295,49 @@ If a write returns a job, wait for it before asserting. Reading back
 too early reports the old state, which is indistinguishable from the
 write having failed.
 
+### Announce a generated identifier before the call that creates it
+
+A randomly generated name is the only handle on what a run is about to
+create. Logging it after the call succeeds means a create that reaches
+the API and loses its response — a timeout, a reset, a 500 — leaves a
+real resource nobody can name, and the cleanup step reports "nothing to
+delete" truthfully.
+
+Found twice, in two journeys: a DNS zone under a live TLD, and a
+container server. Print the identifier before the write, not after.
+
+### A fixture proves what was recorded, not what it is named
+
+Two questions, and both have to be answered by looking at the fixture
+rather than at its filename:
+
+- **Does it record the behaviour it is cited for?** A rejection
+  recorded from a name the API refused to *parse* says nothing about a
+  well-formed name that is merely absent. One such fixture had three
+  tests and two doc comments resting on it, all asserting a conclusion
+  the recording did not support.
+- **Can the test tell?** This API rejects two ways — a 200 with
+  `status:false`, and a 400 whose body is only a `msg`. A fixture of
+  the second kind decodes `status` to Go's zero value, so a test
+  asserting the rejection passes for the same reason it would pass
+  against a fixture recording nothing.
+
+When probing for a not-found, use a name the API accepts as
+well-formed. Otherwise the validator answers first and the not-found
+path is never reached.
+
+### Replacing a test is not the same as keeping its coverage
+
+A fixture-backed test and a literal-comparison test catch disjoint
+bugs. A scrubbed fixture's values are placeholders by construction, so
+it cannot detect a `json` tag pointed at the wrong key; the serving
+helper ignores the request path, so it cannot detect a wrong endpoint
+or method. Both were mutated in a package whose fixture tests had just
+replaced hand-written ones, and the suite stayed green.
+
+Swapping one kind for the other is often right. Losing what only the
+old kind could see is not, and nothing turns red when it happens.
+
 ## 3. Before pushing
 
 1. `go build ./...` and `go vet ./...`

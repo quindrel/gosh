@@ -160,8 +160,19 @@ func confirmGone(ctx context.Context, c clients, name string) {
 	time.Sleep(throttle)
 	got, err := c.server.Get(ctx, server.GetRequest{ServerName: name})
 	if err != nil {
-		// The expected outcome: the server is no longer addressable.
-		log.Printf("  ✓ %s is no longer in the API", name)
+		// Only a not-found is evidence of the outcome. Every other
+		// failure of this call — a rate limit, a transient network
+		// error, an expired credential, a 500 — used to land here and
+		// print a tick, which reintroduces the gap this function
+		// exists to close: the delete call reports success from the
+		// control plane, and whether the machine is gone is a
+		// different question. An error is a third state, not the good
+		// one.
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			log.Printf("  ✓ %s is no longer in the API", name)
+			return
+		}
+		log.Printf("  could not confirm %s is gone: %v", name, err)
 		return
 	}
 	if len(got.Server.Ips) == 0 {

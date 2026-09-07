@@ -99,12 +99,31 @@ def check_wire_contracts(rep: Report) -> None:
             fn = re.search(r"func (?:\([^)]*\) )?(\w+)\(", body)
             fn = fn.group(1) if fn else "?"
 
+            # Two shapes, and both have to be read. A keys variable:
+            #
+            #     keys := []string{"client_id", "name"}
+            #
+            # and the list written inline as an argument:
+            #
+            #     net.Encode(values, []string{"client_id", "code"})
+            #
+            # Only the first was matched, so twelve of the ninety-five
+            # call sites were skipped in silence — ten of them in
+            # pkg/api/dns/template, where the inline form is the norm.
+            # Dropping a key from an inline list produced no finding at
+            # all.
+            key_text = ""
             km = re.search(r"keys\s*:?=\s*\[\]string\{(.*?)\n\t\}", body, re.S)
             if not km:
                 km = re.search(r"keys\s*:?=\s*\[\]string\{([^}]*)\}", body, re.S)
-            if not km:
+            if km:
+                key_text = km.group(1)
+            for inline in re.finditer(
+                    r"net\.Encode\([^,]+,\s*\[\]string\{([^}]*)\}", body):
+                key_text += "," + inline.group(1)
+            if not key_text:
                 continue
-            keys = set(re.findall(r'"([^"]+)"', km.group(1)))
+            keys = set(re.findall(r'"([^"]+)"', key_text))
             dynamic = False
             for am in re.finditer(r"keys\s*=\s*append\(keys,\s*(.*?)\)", body):
                 found = re.findall(r'"([^"]+)"', am.group(1))
@@ -121,6 +140,19 @@ def check_wire_contracts(rep: Report) -> None:
             adds = [a for a in adds if not re.search(
                 r"Header\.(?:Add|Set)\(\s*\"" + re.escape(a) + r"\"", body)]
             where = f"{path}:{fn}()"
+
+            if dynamic:
+                # Silence and "checked and clean" must not look the
+                # same. One append with a non-literal argument
+                # suppressed every finding for the rest of the
+                # function, including literal values.Add calls the
+                # check could still have judged — and said nothing
+                # about having given up.
+                rep.review(
+                    "wire-contract", where,
+                    "builds its keys list dynamically, so the absent-key check "
+                    "cannot judge this function; verify the parameters by hand",
+                )
 
             for a in sorted(set(adds)):
                 if a in keys or dynamic:
@@ -168,7 +200,11 @@ def observed_shapes() -> dict[str, set[str]]:
     "[]" and a quoted integer stays quoted. That makes testdata a
     record of what the API really sends, not of what anyone believed.
     """
-    shapes: dict[str, set[str]] = {}
+    # Keyed by (package directory, wire key). Keying on the bare key
+    # name meant a "disk" key in one package's fixtures flagged a
+    # "disk" field in an unrelated one, with no association between
+    # them beyond the spelling.
+    shapes: dict[tuple[str, str], set[str]] = {}
 
     def walk(o) -> None:
         if isinstance(o, dict):
@@ -185,7 +221,7 @@ def observed_shapes() -> dict[str, set[str]]:
                     t = "empty-object" if not v else "object"
                 else:
                     t = "number"
-                shapes.setdefault(k, set()).add(t)
+                shapes.setdefault((pkg, k), set()).add(t)
                 walk(v)
         elif isinstance(o, list):
             for x in o:
@@ -194,6 +230,9 @@ def observed_shapes() -> dict[str, set[str]]:
     for dirpath, _, names in os.walk("."):
         if "/testdata" not in dirpath or "/.git" in dirpath:
             continue
+        # The package a fixture belongs to is its testdata directory's
+        # parent, which is what scopes the observation.
+        pkg = os.path.normpath(os.path.dirname(dirpath.rstrip("/")))
         for n in names:
             if not n.endswith(".json"):
                 continue
@@ -242,14 +281,21 @@ def check_empty_shapes(rep: Report) -> None:
         for m in re.finditer(pattern, src):
             field, typ, key = m.group(1), m.group(2), m.group(3)
             line = src[: m.start()].count("\n") + 1
-            observed = seen.get(key, set())
+            observed = seen.get((os.path.normpath(os.path.dirname(path)), key), set())
             if not observed:
                 continue
             if "empty-list" in observed or "empty-object" in observed:
-                rep.confirmed(
+                # REVIEW, not CONFIRMED. This establishes one half of
+                # the claim — that a fixture shows the key arriving
+                # empty — and never looks at the decoder. A
+                # shtypes.Maybe* type written to accept [], with tests
+                # proving it, was reported as a defect that blocked the
+                # push. The message was always a question addressed to
+                # a human, which is the definition of a REVIEW line.
+                rep.review(
                     "empty-shape", f"{path}:{line}",
                     f"{field} ({typ}) reads the {key} key, which a committed fixture "
-                    f"shows arriving empty "
+                    f"in this package shows arriving empty "
                     f"({', '.join(sorted(observed))}); confirm the decoder tolerates it",
                 )
 
@@ -367,14 +413,35 @@ def check_unasserted_options(rep: Report, base: str) -> None:
             body = src[m.start(): nxt if nxt > 0 else len(src)]
             if "httptest.NewServer" not in body:
                 continue
+
+            # Search the handler closure only, and bound it at the
+            # closing "}))".
+            #
+            # The setter lives in the function body, so any test of "is
+            # this name mentioned in the body" is answered by the very
+            # line that prompted the question. The first version of
+            # this check did that and could not fire for any input: for
+            # a CamelCase field F, snake_of(F).replace("_", "") is
+            # F.lower(), always present in body.lower() because the
+            # match came from the body.
+            #
+            # Slicing from httptest.NewServer to the end of the
+            # function is not enough either — the request literal
+            # usually sits after the handler, so the setter is still in
+            # scope. That version also could not fire. Hence the bound.
+            start = body.find("httptest.NewServer")
+            end = body.find("}))", start)
+            handler = body[start: end if end > 0 else len(body)]
+
             for fm in re.finditer(r"^\s*([A-Z]\w+):\s+\"([^\"]+)\",", body, re.M):
                 field_name, value = fm.group(1), fm.group(2)
                 snake = re.sub(r"(?<!^)(?=[A-Z])", "_", field_name).lower()
-                # Present under any spelling, or the value itself is
-                # asserted somewhere, means it is pinned.
-                if snake in body or snake.replace("_", "") in body.lower():
-                    continue
-                if f'"{value}"' in body.replace(fm.group(0), ""):
+                # Pinned if the handler looks for the wire name or the
+                # value. Deliberately not the Go field name: a handler
+                # reads query and form parameters, so the wire spelling
+                # is what an assertion would name, and accepting the Go
+                # spelling reopened the hole this check had.
+                if snake in handler or f'"{value}"' in handler:
                     continue
                 # Only meaningful for request options, not arbitrary
                 # struct literals in a fixture.
@@ -391,8 +458,14 @@ def check_unasserted_options(rep: Report, base: str) -> None:
 # and requiring an exact method name missed every one of them — so the
 # DNS journey, which creates and destroys zones, was never flagged.
 MUTATES = re.compile(r"\.(Add|Create|Update|Delete|Restore|Remove|Swap|Set)\w*\(")
-OUT_OF_BAND = ("sshRun", "tcpReachable", "waitReachability", "assertBlocked",
-               "assertReachable", "net.Dial", "exists(")
+# Ways a step can observe a result without asking the API that produced
+# it. HTTP belongs here: fetching a page a deploy was supposed to serve
+# is a socket to the thing itself, and a journey that verified that way
+# was flagged as control-plane-only.
+OUT_OF_BAND = ("sshRun", "sshRunAs", "tcpReachable", "waitReachability",
+               "assertBlocked", "assertReachable", "net.Dial", "exists(",
+               "httpGetStatus", "waitHTTPServed", "curlFromHost",
+               "waitCurlFromHost", "http.Get", "dig ", "net.Lookup")
 
 
 def check_control_plane_only(rep: Report) -> None:
@@ -469,6 +542,12 @@ def check_destructive_fallbacks(rep: Report) -> None:
                 )
 
 
+# Sentences that disclaim a variable rather than promise it.
+NEGATION = re.compile(
+    r"\b(not read|never read|not honou?red|ignored|deliberately|"
+    r"elsewhere|no longer|unused)\b", re.I)
+
+
 # --------------------------------------------------------------------
 # 7. Documented but not read
 # --------------------------------------------------------------------
@@ -487,21 +566,53 @@ def check_documented_env(rep: Report) -> None:
         {os.path.dirname(p) for p in go_files("examples", tests=False)}
     ):
         code = "".join(read(p) for p in go_files(root, tests=False))
+
+        # Documentation means the README and comment lines, not the
+        # whole source. Including the code meant any mention anywhere
+        # counted as a promise — including a comment written to say a
+        # variable is deliberately NOT honoured, which is the one case
+        # where the code is right and the documentation is doing its
+        # job.
         docs = ""
-        for name in ("README.md",):
-            p = os.path.join(root, name)
-            if os.path.exists(p):
-                docs += read(p)
-        docs += code  # package doc comments live in the code
+        readme = os.path.join(root, "README.md")
+        if os.path.exists(readme):
+            docs += read(readme)
+        for line in code.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("//"):
+                continue
+            # A sentence that disclaims the variable is not a promise
+            # to read it.
+            if NEGATION.search(stripped):
+                continue
+            docs += stripped + "\n"
 
         documented = set(re.findall(r"\b(SH_[A-Z0-9_]+)\b", docs))
-        read_vars = set(re.findall(r"os\.Getenv\(\"(SH_[A-Z0-9_]+)\"\)", code))
-        read_vars |= set(re.findall(r"envOr\(\"(SH_[A-Z0-9_]+)\"", code))
+
+        # Any occurrence inside an environment lookup counts, literal
+        # or not, and so does binding the name to a constant — both are
+        # reads, and requiring the literal call shape missed them.
+        read_vars: set[str] = set()
+        for call in re.finditer(r"(?:os\.Getenv|os\.LookupEnv|envOr)\(([^)]*)\)", code):
+            read_vars |= set(re.findall(r"(SH_[A-Z0-9_]+)", call.group(1)))
+        for assign in re.finditer(r"(?:const|var)\s+\w+\s*=\s*\"(SH_[A-Z0-9_]+)\"", code):
+            read_vars.add(assign.group(1))
+        # A name held in a const and passed by identifier: if the
+        # program mentions the token in any assignment at all, the
+        # script cannot prove it is unread.
+        for assign in re.finditer(r"=\s*\"(SH_[A-Z0-9_]+)\"", code):
+            read_vars.add(assign.group(1))
 
         for var in sorted(documented - read_vars):
-            rep.confirmed(
+            # REVIEW rather than CONFIRMED. The true finding is
+            # valuable — a documented variable that is silently ignored
+            # sends someone pointing at a sandbox to production — but
+            # the script reads prose to decide, and prose is not
+            # something it can prove things about.
+            rep.review(
                 "documented-not-read", root,
-                f"{var} is documented but the program never reads it",
+                f"{var} appears in documentation but no environment read of it "
+                f"is visible; confirm it is honoured or that the mention says it is not",
             )
 
 
@@ -549,7 +660,22 @@ def check_absolute_claims(rep: Report, base: str) -> None:
         for n, line in enumerate(lines):
             if not line.strip().startswith("//"):
                 continue
-            m = ABSOLUTE.search(line)
+            # Quoted text is evidence, not a claim. A doc comment that
+            # reproduces an API's own error — "the server must be on" —
+            # is recording what the platform said, and the phrase
+            # belongs to the platform rather than to the function
+            # underneath. Flagging those meant the more precisely a
+            # comment quoted its source, the more likely it was to be
+            # reported.
+            unquoted = re.sub(r'"[^"]*"', "", line)
+            # A quotation that wraps onto the next comment line leaves
+            # an unbalanced quote behind, and the phrase often sits in
+            # the tail — which is how "the server must be / on." was
+            # still reported after quoted spans were excluded. Drop
+            # from the dangling quote to the end of the line.
+            if unquoted.count('"') % 2 == 1:
+                unquoted = unquoted[: unquoted.index('"')]
+            m = ABSOLUTE.search(unquoted)
             if not m:
                 continue
             # Find the declaration this comment belongs to, and count
@@ -652,11 +778,90 @@ CHECKS = [
 ]
 
 
+SELFTEST_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "selftest")
+
+
+def selftest() -> int:
+    """Run the checks against the fixtures and assert they still fire.
+
+    A check whose failure mode is silence needs a test more than most
+    code does. Two checks here shipped unable to fire for any input,
+    and neither was visible in the output: a check that cannot fire
+    reports exactly what a clean tree reports.
+
+    The fixtures live under selftest/ and are Go files by extension
+    only — they are never compiled, and the directory is outside the
+    module's package layout so `go build ./...` does not see them.
+    """
+    expected_path = os.path.join(SELFTEST_DIR, "expected.json")
+    with open(expected_path, encoding="utf-8") as fh:
+        expected = json.load(fh)
+
+    # The checks walk "pkg" and "examples" relative to the working
+    # directory, so the fixtures live under those names inside
+    # selftest/ and the directory is swapped rather than the signatures
+    # changed.
+    cwd = os.getcwd()
+    rep = Report()
+    try:
+        os.chdir(SELFTEST_DIR)
+        for _, fn, needs_base in CHECKS:
+            # Diff-based checks are given HEAD and simply find nothing
+            # here, which is fine — the fixtures assert on the checks
+            # that walk the tree. Calling them anyway keeps this honest
+            # about which checks the self-test does and does not cover.
+            fn(rep, "HEAD") if needs_base else fn(rep)
+    finally:
+        os.chdir(cwd)
+
+    got: dict[str, int] = {}
+    for f in rep.findings:
+        got[f.check] = got.get(f.check, 0) + 1
+
+    failed = False
+    for check, want in expected.items():
+        if got.get(check, 0) < want:
+            print(f"SELFTEST FAIL: {check} produced {got.get(check, 0)} "
+                  f"finding(s) on the fixtures, expected at least {want}")
+            failed = True
+        else:
+            print(f"  ok  {check}: {got.get(check, 0)} finding(s)")
+
+    if failed:
+        print("\nA check stopped firing on the fixture written for it. "
+              "That is not a clean tree — it is a check that no longer works.")
+        return 1
+    print("\nselftest: every checked fixture still fires")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="origin/main")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the checks against selftest/ and assert they fire")
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    # A checker that cannot see the diff has to say so rather than
+    # pass. Three checks resolve the base through git and discarded the
+    # exit status, so a base that does not exist — the default in CI,
+    # where a depth-1 checkout creates no refs/remotes/origin/* — made
+    # them examine an empty file list and report nothing. That is
+    # indistinguishable from a clean branch.
+    probe = subprocess.run(["git", "rev-parse", "--verify", args.base],
+                           capture_output=True, check=False)
+    if probe.returncode != 0:
+        print(f"premr: base ref {args.base!r} does not resolve in this "
+              f"working copy, so the diff-based checks cannot run.",
+              file=sys.stderr)
+        print("premr: in CI, check out with fetch-depth: 0 so the base "
+              "branch is present.", file=sys.stderr)
+        return 2
 
     rep = Report()
     for _, fn, needs_base in CHECKS:

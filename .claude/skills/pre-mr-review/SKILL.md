@@ -29,10 +29,34 @@ Takes under a second. Output is in two parts:
 - **REVIEW** — a candidate the script cannot judge. Not a defect: a
   question. Answer each one, and say why when dismissing.
 
+The line between them is what the script can *prove*, not how likely
+it is to be right. A check that establishes half a claim and asks a
+human about the other half belongs in REVIEW however good its hit rate
+— two shipped as CONFIRMED and both blocked pushes over correct code.
+
 If a CONFIRMED finding is wrong, fix the *script*, not the code. A
 check that cries wolf gets ignored, which is the same disease as a
 check that cannot fail. The first version of this script reported three
 false positives by matching `req.Header.Set` as a query parameter.
+
+**Silence and "checked and clean" must never look the same.** This is
+the failure this script is most prone to, because both produce an empty
+report:
+
+- Two checks shipped unable to fire for *any* input. `--selftest` runs
+  each check against a fixture written to trip it, and fails if one
+  stops firing. Run it in CI ahead of the checks themselves.
+- Three checks resolved the base ref through git and discarded the exit
+  status, so in CI — where a depth-1 checkout creates no
+  `refs/remotes/origin/*` — they examined an empty file list and
+  reported nothing. The script now refuses to run at all when the base
+  does not resolve, and CI checks out with `fetch-depth: 0`.
+- A check that gives up on a function it cannot analyse now says so as
+  a REVIEW line rather than skipping quietly.
+
+When adding a check, ask what it does when it cannot answer. If the
+answer is "the same as when everything is fine", it needs a fixture and
+a self-test more than it needs another pattern.
 
 ## 1b. Run them again against the fix
 

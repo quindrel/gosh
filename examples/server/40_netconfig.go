@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
@@ -74,12 +73,16 @@ func stepNetConfig(ctx context.Context, c clients, st *state) error {
 // and skips with a reason when there is not one, because a check that
 // quietly does nothing is worse than one that says it cannot run.
 func compareWithGuest(st *state, name string, files map[string]string) error {
-	if len(st.privateKey) == 0 && os.Getenv("SH_SSH_KEY_FILE") == "" {
-		log.Printf("  no SSH key available; not comparing against the guest's own file")
+	// requireKey rather than a copy of its condition. The inline
+	// version reproduced the helper exactly, including the subtlety its
+	// comment records — that assigning an empty key would mask the
+	// SH_SSH_KEY_FILE fallback — and a copy of a guard is a guard that
+	// only gets fixed once. Only the failure behaviour differs here,
+	// and that is the caller's business: this step skips rather than
+	// fails.
+	if err := requireKey(st, "comparing against the guest's own file"); err != nil {
+		log.Printf("  %v; not comparing against the guest's own file", err)
 		return nil
-	}
-	if len(st.privateKey) > 0 {
-		journeyKey = st.privateKey
 	}
 
 	addr, err := addressOf(st, name)
@@ -102,7 +105,11 @@ func compareWithGuest(st *state, name string, files map[string]string) error {
 		// That mistake had already been made and fixed once in the
 		// snapshot step; writing this from memory rather than reusing
 		// the helper reproduced it.
-		if !exists(addr, path) {
+		present, err := exists(addr, path)
+		if err != nil {
+			return err
+		}
+		if !present {
 			return fmt.Errorf("the platform renders %s for %s, but that path does not exist on the guest; step 50 would write a file nothing reads and the reboot in step 70 would come up on the old addressing", path, name)
 		}
 		log.Printf("  ✓ %s exists on %s, so step 50 will write a file the guest actually uses", path, name)

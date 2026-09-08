@@ -58,6 +58,48 @@ When adding a check, ask what it does when it cannot answer. If the
 answer is "the same as when everything is fine", it needs a fixture and
 a self-test more than it needs another pattern.
 
+### A fragment is not a value
+
+The sharpest version of that failure, because it produces confident
+silence rather than no output. When a check reads a value out of source
+text, it has three possible outcomes and only two are usually
+considered:
+
+1. it extracted nothing,
+2. it extracted the whole value,
+3. **it extracted part of the value and cannot tell.**
+
+A quoted literal adjacent to `+` is case 3. `"environments["+name+".env]"`
+yields `environments[` and `.env]`, and both the declaring side and the
+sending side get mangled identically — so they agree, and agreement
+between two identically broken extractions looks exactly like
+verification. Worse, finding *some* literals cleared the flag that
+existed to say "I cannot read this function", so nothing reported the
+gap. Two call sites were reported clean having had none of their real
+parameter names read; one of them has ten.
+
+So: when a pattern extracts a literal, check what sits next to it. If
+the answer is a concatenation, an index, or a format verb, the check
+has a fragment and must say it cannot judge — never compare fragments
+and never treat a partial read as a clean one.
+
+### Fixtures have to be adversarial, not illustrative
+
+A fixture built from the bug you already found only proves the check
+still catches that bug. The fixtures that matter are the inputs a check
+is most likely to be blind to:
+
+- a value built by concatenation rather than written as a literal,
+- the same construct written the other way round (`prefix+"[x]"` as
+  well as `"x["+suffix`), because an extractor anchored to a leading
+  literal cannot see the first form,
+- a construct where the check finds *something*, since a partial find
+  is what disables the "cannot judge" path.
+
+Every one of those was a real blind spot here, and each was invisible
+in the output. When adding a check, write the fixture that would defeat
+it before writing the fixture that demonstrates it.
+
 ## 1b. Run them again against the fix
 
 After addressing a review round, run the checks a second time with

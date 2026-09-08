@@ -124,12 +124,48 @@ def check_wire_contracts(rep: Report) -> None:
             if not key_text:
                 continue
             keys = set(re.findall(r'"([^"]+)"', key_text))
+
+            # dynamic means "this function's parameter names cannot be
+            # read from the source", and it is what makes the check say
+            # so rather than stay quiet.
+            #
+            # A quoted literal next to a "+" is a FRAGMENT, not a key.
+            # Extracting it and treating the extraction as success is
+            # how two call sites came to be reported clean while none of
+            # their real parameters had been seen:
+            #
+            #   keys = append(keys, "environments["+request.Name+".env]")
+            #   values.Add("environments["+request.Name+".env]", ...)
+            #
+            # yielded "environments[" and ".env]" on both sides, so they
+            # agreed — agreement between two identically mangled
+            # fragments, not verification. And because literals *were*
+            # found, dynamic stayed false, so nothing said the function
+            # was unjudgeable.
+            #
+            #   keys = append(keys, prefix+"[enabled]")
+            #   values.Add(prefix+"[enabled]", ...)
+            #
+            # was worse: the append yielded "[enabled]", again clearing
+            # dynamic, while the Add was invisible to the extractor
+            # because its literal is not the first token. Ten
+            # parameters, none seen, reported clean.
             dynamic = False
             for am in re.finditer(r"keys\s*=\s*append\(keys,\s*(.*?)\)", body):
-                found = re.findall(r'"([^"]+)"', am.group(1))
+                arg = am.group(1)
+                if "+" in arg:
+                    dynamic = True
+                    continue
+                found = re.findall(r'"([^"]+)"', arg)
                 keys |= set(found)
                 if not found:
                     dynamic = True
+
+            # The same rule on the sending side: a key built by
+            # concatenation cannot be compared against the keys list,
+            # whichever end the literal sits at.
+            if re.search(r"\w+\.(?:Add|Set)\(\s*(?:\"[^\"]*\"\s*\+|\w+\s*\+)", body):
+                dynamic = True
 
             # Header.Set is not a query parameter. Matching it produced
             # three false CONFIRMED findings on the first run, which is
@@ -153,11 +189,13 @@ def check_wire_contracts(rep: Report) -> None:
             #     would go unreported. "type" is both a parameter name
             #     in this repository and a plausible header, so the
             #     collision is not hypothetical.
+            # Only whole literal keys: a match followed by "+" is a
+            # fragment and is skipped, having already set dynamic above.
             adds = [
                 m.group(2)
                 for m in re.finditer(
-                    r"\b(\w+)\.(?:Add|Set)\(\s*\"([^\"]+)\"", body)
-                if m.group(1) != "Header"
+                    r"\b(\w+)\.(?:Add|Set)\(\s*\"([^\"]+)\"\s*(?P<cat>\+?)", body)
+                if m.group(1) != "Header" and not m.group("cat")
             ]
             where = f"{path}:{fn}()"
 

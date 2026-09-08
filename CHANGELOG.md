@@ -79,7 +79,10 @@ All notable changes to this project will be documented in this file. The format 
   one stops firing, because a check that cannot fire reports exactly
   what a clean tree reports — two of them shipped that way. For the
   same reason the checker now refuses to run when its base ref does not
-  resolve, rather than examining an empty diff and passing.
+  resolve, rather than examining an empty diff and passing, and reports
+  a branch that changes shipped code without adding a CHANGELOG entry —
+  the omission this repository comments on most, and one the entry
+  *content* check had nothing to say about.
 
 ### Changed
 

@@ -362,6 +362,46 @@ def check_empty_shapes(rep: Report) -> None:
 # 3. CHANGELOG claims
 # --------------------------------------------------------------------
 
+def check_changelog_missing(rep: Report, base: str) -> None:
+    """A branch that changes shipped code and adds no CHANGELOG entry.
+
+    The repository's rule is that every merged PR carries its own
+    entry, and a missing one is the most frequent review comment it
+    gets. The neighbouring check validates the *content* of entries
+    against the tree and had nothing to say about their absence — so a
+    branch with no entry at all passed every mechanical check, which is
+    how one reached review having run all of them.
+
+    Docs-only and test-only branches are exempt: there is nothing for a
+    consumer to be told.
+    """
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", f"{base}...HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+    if not changed:
+        return
+    if "CHANGELOG.md" in changed:
+        return
+
+    # What counts as shipped code: the SDK, and the examples, which this
+    # repository treats as documentation that fails loudly.
+    notable = [
+        p for p in changed
+        if (p.startswith("pkg/") or p.startswith("examples/"))
+        and p.endswith(".go") and not p.endswith("_test.go")
+    ]
+    if not notable:
+        return
+
+    rep.confirmed(
+        "changelog-missing", "CHANGELOG.md",
+        f"{len(notable)} non-test Go file(s) changed and no CHANGELOG entry was "
+        f"added; every merged PR carries one, and a missing entry is this "
+        f"repository's most common review comment",
+    )
+
+
 def check_changelog_claims(rep: Report, base: str) -> None:
     """Symbols the CHANGELOG names that are not in the tree.
 
@@ -936,6 +976,7 @@ CHECKS = [
     ("wire contracts", check_wire_contracts, False),
     ("empty-collection tolerance", check_empty_shapes, False),
     ("CHANGELOG claims", check_changelog_claims, True),
+    ("CHANGELOG missing", check_changelog_missing, True),
     ("historical claims", check_historical_claims, True),
     ("unasserted options", check_unasserted_options, True),
     ("control-plane-only verification", check_control_plane_only, False),

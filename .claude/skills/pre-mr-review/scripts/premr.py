@@ -135,10 +135,30 @@ def check_wire_contracts(rep: Report) -> None:
             # three false CONFIRMED findings on the first run, which is
             # the failure this tool can least afford: a check that cries
             # wolf gets ignored, exactly like one that cannot fail.
-            adds = re.findall(
-                r"(?<!Header)\b(?<!Header\.)\w+\.(?:Add|Set)\(\s*\"([^\"]+)\"", body)
-            adds = [a for a in adds if not re.search(
-                r"Header\.(?:Add|Set)\(\s*\"" + re.escape(a) + r"\"", body)]
+            #
+            # The receiver is captured and compared, rather than excluded
+            # with a lookbehind. Two earlier attempts got this wrong:
+            #
+            #   - (?<!Header)\b(?<!Header\.) excluded nothing at all,
+            #     because \w+ binds to "Header" itself, so the
+            #     lookbehinds were evaluated against what precedes
+            #     "Header" — "req." — rather than against what precedes
+            #     ".Set". The pattern behaved identically with them
+            #     removed.
+            #   - Filtering out any key name that also appeared in a
+            #     Header.Add/Set call anywhere in the body did work, but
+            #     globally: a genuine query parameter sharing a name
+            #     with a header set elsewhere in the same function was
+            #     suppressed too, so a real absent-key bug on that name
+            #     would go unreported. "type" is both a parameter name
+            #     in this repository and a plausible header, so the
+            #     collision is not hypothetical.
+            adds = [
+                m.group(2)
+                for m in re.finditer(
+                    r"\b(\w+)\.(?:Add|Set)\(\s*\"([^\"]+)\"", body)
+                if m.group(1) != "Header"
+            ]
             where = f"{path}:{fn}()"
 
             if dynamic:

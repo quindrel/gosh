@@ -972,6 +972,98 @@ def check_dropped_assertions(rep: Report, base: str) -> None:
             )
 
 
+
+# --------------------------------------------------------------------
+# 13. Build artefacts in the diff
+# --------------------------------------------------------------------
+
+def check_binary_artefacts(rep: Report, base: str) -> None:
+    """Compiled or generated files added by the branch.
+
+    Found this way: a __pycache__/*.pyc committed alongside the checker
+    it belongs to. The repository's rule is to stage by explicit path
+    rather than `git add -A`, which guards against stale artefacts at
+    the repo root — and does nothing about one that materialises inside
+    the directory you meant to stage. Running the checker writes its
+    bytecode next to its source, so `git add .claude/` picks it up
+    without anyone deciding to.
+    """
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", "--diff-filter=A", f"{base}...HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+
+    suspect = (
+        ".pyc", ".pyo", ".class", ".o", ".a", ".so", ".dylib", ".exe",
+        ".test", ".out", ".DS_Store",
+    )
+    for path in changed:
+        base_name = os.path.basename(path)
+        if "__pycache__" in path or path.endswith(suspect) or base_name == ".DS_Store":
+            rep.confirmed(
+                "build-artefact", path,
+                "is a build artefact added by this branch; it should be ignored "
+                "rather than committed",
+            )
+            continue
+        # A tracked file with no extension that is not text is usually a
+        # compiled binary left by `go build ./some/pkg`.
+        if "." not in base_name and os.path.exists(path):
+            try:
+                with open(path, "rb") as fh:
+                    if b"\0" in fh.read(1024):
+                        rep.confirmed(
+                            "build-artefact", path,
+                            "looks like a compiled binary added by this branch",
+                        )
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------
+# 14. Claims nothing in the tree can support
+# --------------------------------------------------------------------
+
+COST_CLAIM = re.compile(
+    r"\b(is free|costs? nothing|no charge|free of charge|does not cost|"
+    r"costs money|is billable|will be billed)\b", re.I)
+
+
+def check_cost_claims(rep: Report, base: str) -> None:
+    """Billing assertions in documentation.
+
+    A reader cannot check one with a probe, and nothing in a fixture can
+    evidence it, so it is the class of claim most likely to be repeated
+    from memory and least likely to be caught.
+
+    Found this way: "which is free", "It costs nothing" and "only one of
+    them costs money" across three files of one example, with no
+    citation behind any of them — in a branch whose stated purpose was
+    replacing assumed behaviour with observed behaviour.
+    """
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", f"{base}...HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.split()
+
+    for path in changed:
+        if not (path.endswith(".go") or path.endswith(".md")):
+            continue
+        if not os.path.exists(path):
+            continue
+        for n, line in enumerate(read(path).split("\n"), 1):
+            stripped = line.strip()
+            if not (stripped.startswith("//") or path.endswith(".md")):
+                continue
+            if COST_CLAIM.search(stripped):
+                rep.review(
+                    "cost-claim", f"{path}:{n}",
+                    "asserts what something costs; confirm it is evidenced, or "
+                    "narrow it to what is known (which operation is billable "
+                    "rather than what it costs)",
+                )
+
+
 CHECKS = [
     ("wire contracts", check_wire_contracts, False),
     ("empty-collection tolerance", check_empty_shapes, False),
@@ -986,6 +1078,8 @@ CHECKS = [
     ("sibling sites", check_sibling_sites, True),
     ("rejection fixtures", check_rejection_fixtures, False),
     ("dropped assertions", check_dropped_assertions, True),
+    ("build artefacts", check_binary_artefacts, True),
+    ("cost claims", check_cost_claims, True),
 ]
 
 

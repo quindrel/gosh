@@ -380,6 +380,61 @@ replaced hand-written ones, and the suite stayed green.
 Swapping one kind for the other is often right. Losing what only the
 old kind could see is not, and nothing turns red when it happens.
 
+### Fixing a claim is not the same as removing it
+
+The failure mode of a review round, and it is worse than the finding it
+answers. A doc asserts something the tree does not support; the fix
+replaces it with a *different* thing the tree does not support, and adds
+a comment saying the gap is now closed. The original silence at least
+left the hole visible.
+
+Four of five fixes in one round did this:
+
+- A false safety claim was replaced with a categorical one — "it would
+  fail to create, because the account does not hold that name" — that
+  the journey's own success path refutes on every run.
+- Evidence re-recorded for one endpoint and left alone for its sibling,
+  which then rested on precisely the evidence the same round had argued
+  proves nothing.
+- An assertion added for a gap, which asserts something else, **plus a
+  comment saying it closes the gap**. Deleting the field it named still
+  passed.
+- A comment crediting new code with fixing a case it does not handle.
+
+So when answering a claim-versus-evidence finding, do two things before
+replying. State what the replacement claim rests on — a fixture, a
+recorded probe, a test — and if the answer is "reasoning", it is the
+same finding again. And run the thing: delete the field, break the tag,
+make the condition true. Every one of the above survived a careful
+re-read and died the moment somebody executed it.
+
+### Do not trade a categorical guarantee for an asserted one
+
+A safety property that holds *by construction* is worth more than the
+same property written in a comment, and swapping one for the other
+while fixing something unrelated is easy to miss.
+
+A probe step was safe because its target name was under `.invalid`,
+which the API cannot accept — so destructive probes could not touch
+anything, by construction. Correcting a different finding moved it to a
+real TLD, and the guarantee became a sentence: "a name this account does
+not hold", enforced by nothing, in a step documented read-only and
+gated behind no opt-in.
+
+When a fix removes the reason something was safe, the replacement has
+to be a check. Ask what made this safe before, and does that still hold.
+
+### Assertions about money
+
+Nothing in a fixture can evidence what an operation costs, and a reader
+cannot check it with a probe, so a billing claim is the one most likely
+to be written from memory and least likely to be caught. Three appeared
+in one example, unevidenced, in a branch whose purpose was replacing
+assumed behaviour with observed behaviour.
+
+Say which operation is billable, not what it costs, unless there is a
+citation.
+
 ## 3. Before pushing
 
 1. `go build ./...` and `go vet ./...`

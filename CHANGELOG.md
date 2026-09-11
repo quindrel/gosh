@@ -78,8 +78,13 @@ All notable changes to this project will be documented in this file. The format 
   runs every check against a fixture written to defeat it and fails if
   one stops firing, because a check that cannot fire reports exactly
   what a clean tree reports — two of them shipped that way. For the
-  same reason the checker now refuses to run when its base ref does not
-  resolve, rather than examining an empty diff and passing, and reports
+  same reason it reports a build artefact added by a branch — a
+  committed `.pyc` is what prompted that one, and the repository's
+  stage-by-explicit-path rule does not help when the artefact appears
+  inside the directory being staged — and asks about a billing claim in
+  documentation, which no fixture can evidence and no reader can probe.
+  For the same reason the checker refuses to run when its base ref does
+  not resolve, rather than examining an empty diff and passing, and reports
   a branch that changes shipped code without adding a CHANGELOG entry —
   the omission this repository comments on most, and one the entry
   *content* check had nothing to say about.
